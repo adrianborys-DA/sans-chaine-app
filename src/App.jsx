@@ -389,26 +389,6 @@ const App = () => {
     }
   };
 
-    const delays = [1000, 2000, 4000, 8000, 16000];
-    for (let i = 0; i < 6; i++) {
-      try {
-        const response = await fetch(url, { 
-          method: 'POST', 
-          headers: { 
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}` 
-          }, 
-          body: JSON.stringify(payload) 
-        });
-        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-        const result = await response.json();
-        return result.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
-      } catch (err) {
-        if (i === 5) return "Error: Unable to connect to the analysis engine.";
-        await new Promise(resolve => setTimeout(resolve, delays[i]));
-      }
-    }
-  };
 
   // --- Agent & Telemetry Logic ---
   const getPowerZone = (val, z) => {
