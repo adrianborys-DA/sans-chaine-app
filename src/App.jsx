@@ -383,9 +383,14 @@ const App = () => {
         const result = await response.json();
         return result.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
       } catch (err) {
-        if (i === 5) return "Error: Unable to connect to the analysis engine.";
-        await new Promise(resolve => setTimeout(resolve, delays[i]));
-      }
+  console.error("OpenAI request failed:", err);
+
+  if (i === 5) {
+    return `Error: Unable to connect to the analysis engine. Details: ${err.message}`;
+  }
+
+  await new Promise(resolve => setTimeout(resolve, delays[i]));
+}
     }
   };
 
