@@ -360,7 +360,7 @@ const App = () => {
     const apiKey = import.meta.env.VITE_OPENAI_API_KEY; 
     const url = `https://api.openai.com/v1/chat/completions`;
     const payload = {
-      model: "gpt-4o", // You can change this to "gpt-3.5-turbo" if you want it to be cheaper/faster
+      model: "gpt-4o-mini", // You can change this to "gpt-3.5-turbo" if you want it to be cheaper/faster
       messages: [
         { role: "system", content: systemInstruction },
         { role: "user", content: prompt }
@@ -379,7 +379,10 @@ const App = () => {
           }, 
           body: JSON.stringify(payload) 
         });
-        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+        if (!response.ok) {
+  const errorText = await response.text();
+  throw new Error(`HTTP ${response.status}: ${errorText}`);
+}
         const result = await response.json();
         return result.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
       } catch (err) {
