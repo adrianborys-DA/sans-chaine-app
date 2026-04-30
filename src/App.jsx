@@ -445,12 +445,14 @@ const App = () => {
     let recentWorkoutsContext = "No workout data available.";
     if (performanceData.length > 0) {
       const logEntries = [];
-      const blockEndTime = riderData.endDate ? new Date(riderData.endDate + 'T00:00:00').getTime() : Infinity;
+      const today = new Date();
+today.setHours(0,0,0,0);
+const todayTime = today.getTime();
 
       performanceData.forEach(week => {
         week.days.forEach(day => {
           const currentDayTime = new Date(day.date + 'T00:00:00').getTime();
-          if (currentDayTime > blockEndTime) return; 
+          if (currentDayTime > todayTime) return;
           const recoveryStr = day.whoop?.recovery ? ` | WHOOP Recovery: ${day.whoop.recovery}%` : '';
           
           if (day.rides.length > 0) {
