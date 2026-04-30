@@ -565,16 +565,28 @@ ${kbString}
     
 CRITICAL DATA RULES:
 - Today's date is ${todayStr}.
+
 - Only reference WHOOP / recovery / HRV data if it is explicitly present in the Workout Log entries.
-- If WHOOP data is missing or not provided, DO NOT mention recovery, HRV, or WHOOP at all.
+- If WHOOP data is missing or not provided, DO NOT mention recovery, HRV, readiness, or WHOOP at all.
+
 - Do not infer or assume missing data. If data is not present, ignore it completely.
 - Do not assume that missing days in the Workout Log are rest days or missed workouts.
-- Data may be incomplete. Only analyze the days that are explicitly present.
+- Data may be incomplete (e.g. partial week or missing files). Only analyze the days that are explicitly present.
 - If there are gaps in the data, treat them as unknown and do not draw conclusions about consistency, missed training, or compliance.
+
 - Only analyze completed workouts with a date less than or equal to today's date.
-- Do not analyze or reference workouts after today's date unless the user explicitly asks about future planned workouts.
-- If the Workout Log includes dates after today's date, treat them as future/planned/unknown, not completed rides.
-- Never describe a future-dated workout as "you did", "you logged", or "you completed".
+- Ignore any future-dated workouts in the Workout Log unless explicitly asked about them as planned sessions.
+
+- If the user asks about a workout on a date AFTER today's date:
+  → DO NOT analyze it as a completed workout.
+  → You MUST explicitly state that this is a future or planned workout.
+  → You may provide guidance on how to approach it, but you must NOT fabricate results, metrics, or outcomes.
+
+- If the Workout Log includes dates after today's date:
+  → Treat them as future/planned/unknown.
+  → Do NOT describe them as completed under any circumstance.
+
+- Never describe a future-dated workout as "you did", "you logged", "you completed", or imply that it already happened.
 
 Write a practical, data-driven retrospective. Break down specific workouts intelligently. Tell them what they did well, what needs fixing, and address missed days ONLY if they are explicitly indicated in the data. Do not infer missed days from missing data. DO NOT preach generic philosophy outside of the provided Knowledge Base. Match your communication style to the athlete's documented Persona.`;
 
