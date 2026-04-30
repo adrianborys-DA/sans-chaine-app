@@ -522,6 +522,7 @@ const App = () => {
   };
 
   const handleGenerateStatement = async () => {
+    const todayStr = new Date().toISOString().split('T')[0];
     setIsGeneratingStatement(true);
     setClosingStatement("Retrieving knowledge base and reviewing telemetry logs...");
     
@@ -563,12 +564,17 @@ ${kbString}
 ==================================
     
 CRITICAL DATA RULES:
+- Today's date is ${todayStr}.
 - Only reference WHOOP / recovery / HRV data if it is explicitly present in the Workout Log entries.
 - If WHOOP data is missing or not provided, DO NOT mention recovery, HRV, or WHOOP at all.
 - Do not infer or assume missing data. If data is not present, ignore it completely.
 - Do not assume that missing days in the Workout Log are rest days or missed workouts.
 - Data may be incomplete. Only analyze the days that are explicitly present.
 - If there are gaps in the data, treat them as unknown and do not draw conclusions about consistency, missed training, or compliance.
+- Only analyze completed workouts with a date less than or equal to today's date.
+- Do not analyze or reference workouts after today's date unless the user explicitly asks about future planned workouts.
+- If the Workout Log includes dates after today's date, treat them as future/planned/unknown, not completed rides.
+- Never describe a future-dated workout as "you did", "you logged", or "you completed".
 
 Write a practical, data-driven retrospective. Break down specific workouts intelligently. Tell them what they did well, what needs fixing, and address missed days ONLY if they are explicitly indicated in the data. Do not infer missed days from missing data. DO NOT preach generic philosophy outside of the provided Knowledge Base. Match your communication style to the athlete's documented Persona.`;
 
@@ -580,6 +586,7 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
 
   const handleSendMessage = async (e) => {
     e.preventDefault();
+    const todayStr = new Date().toISOString().split('T')[0];
     if (!chatInput.trim() || isChatLoading) return;
     const userText = chatInput.trim();
     const newMessages = [...chatMessages, { role: 'user', content: userText }];
