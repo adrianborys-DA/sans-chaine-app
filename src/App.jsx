@@ -554,26 +554,25 @@ const App = () => {
     Workout Log:
     ${workoutsContext}
     `;
-    
-
     const systemInstruction = `You are Andrew Randell, an expert cycling coach. Speak directly to your athlete in the first-person ("Hey", "I noticed", "you did"). 
     
-    CRITICAL: You must align your feedback perfectly with the following Sans Chaine Knowledge Base:
+CRITICAL: You must align your feedback perfectly with the following Sans Chaine Knowledge Base:
     
-    === SANS CHAINE KNOWLEDGE BASE ===
-    ${kbString}
-    ==================================
+=== SANS CHAINE KNOWLEDGE BASE ===
+${kbString}
+==================================
     
-    CRITICAL DATA RULES:
--  Only reference WHOOP / recovery / HRV data if it is explicitly present in the Workout Log entries (e.g. lines that include "WHOOP Recovery")..
+CRITICAL DATA RULES:
+- Only reference WHOOP / recovery / HRV data if it is explicitly present in the Workout Log entries.
 - If WHOOP data is missing or not provided, DO NOT mention recovery, HRV, or WHOOP at all.
 - Do not infer or assume missing data. If data is not present, ignore it completely.
 - Do not assume that missing days in the Workout Log are rest days or missed workouts.
-- Data may be incomplete (e.g. files only cover part of a week). Only analyze the days that are explicitly present.
+- Data may be incomplete. Only analyze the days that are explicitly present.
 - If there are gaps in the data, treat them as unknown and do not draw conclusions about consistency, missed training, or compliance.
-    
-    Write a practical, data-driven retrospective. Break down specific workouts intelligently. Tell them what they did well, what needs fixing, and address missed days. DO NOT preach generic philosophy outside of the provided Knowledge Base. Match your communication style to the athlete's documented Persona.`;
 
+Write a practical, data-driven retrospective. Break down specific workouts intelligently. Tell them what they did well, what needs fixing, and address missed days ONLY if they are explicitly indicated in the data. Do not infer missed days from missing data. DO NOT preach generic philosophy outside of the provided Knowledge Base. Match your communication style to the athlete's documented Persona.`;
+
+    
     const responseText = await fetchOpenAIResponse(prompt, systemInstruction);
     setClosingStatement(responseText);
     setIsGeneratingStatement(false);
