@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import { 
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, AreaChart, Area, BarChart, Bar, Cell, ComposedChart, ReferenceArea
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, AreaChart, Area, BarChart, Bar, Cell, ComposedChart, ReferenceArea, Brush
 } from 'recharts';
 import { 
   User, Activity, Zap, Brain, ChevronRight, FileText, CheckCircle2, Upload, Database, FileCheck, BarChart3, Target, Info, TrendingDown, TrendingUp, ShieldCheck, Clock, Calendar as CalendarIcon, MessageSquare, Heart, MessageCircle, X, Send, ChevronDown, ChevronUp, Sparkles, Users, BookOpen, Cpu, Plus, Trash2, UserCog, Award, Flag, MapPin, Save, FileArchive, ChevronDownSquare
@@ -98,44 +98,257 @@ const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
 
-// Keep the database chart samples aligned with the report chart.
-// For Block Analysis, the chart needs enough fidelity to show intervals.
-// Rule: save every parsed chart point unless the ride is extremely large; then evenly downsample.
-// This preserves the original local chart shape while avoiding oversized Supabase writes.
-const RIDE_CHART_SAMPLE_MAX_POINTS = 30000;
+// Store the actual compressed FIT record stream for Block Analysis charts.
+// Rule: ride_samples is no longer a broad chart sample. It is the full moving-time
+// FIT record stream after long stop/gap periods are removed by compressRideTimeline().
+// Long-Term View uses ride-level rows; Block Analysis charts use ride_samples.
+const normalizeChartPoint = (point, avgWatts = 0) => ({
+  time: Number((Number(point.t || 0) / 60).toFixed(2)),
+  watts: Number(point.p) || 0,
+  hr: Number(point.hr) || 0,
+  cadence: Number(point.cad) || 0,
+  target: Number(avgWatts) || 0
+});
 
 const buildChartSamples = (dataPoints, avgWatts = 0) => {
   if (!Array.isArray(dataPoints) || dataPoints.length === 0) return [];
-
-  const step = Math.max(1, Math.ceil(dataPoints.length / RIDE_CHART_SAMPLE_MAX_POINTS));
-  const samples = [];
-
-  for (let i = 0; i < dataPoints.length; i += step) {
-    const point = dataPoints[i];
-    samples.push({
-      time: Number((Number(point.t || 0) / 60).toFixed(2)),
-      watts: Number(point.p) || 0,
-      hr: Number(point.hr) || 0,
-      cadence: Number(point.cad) || 0,
-      target: Number(avgWatts) || 0
-    });
-  }
-
-  const lastPoint = dataPoints[dataPoints.length - 1];
-  const finalTime = Number((Number(lastPoint.t || 0) / 60).toFixed(2));
-  if (!samples.length || samples[samples.length - 1].time !== finalTime) {
-    samples.push({
-      time: finalTime,
-      watts: Number(lastPoint.p) || 0,
-      hr: Number(lastPoint.hr) || 0,
-      cadence: Number(lastPoint.cad) || 0,
-      target: Number(avgWatts) || 0
-    });
-  }
-
-  return samples;
+  return [...dataPoints]
+    .sort((a, b) => (Number(a.t) || 0) - (Number(b.t) || 0))
+    .map(point => normalizeChartPoint(point, avgWatts));
 };
 
+// The database stores the detailed ride stream. The small Block Analysis popover
+// should not draw every record directly, because thousands of SVG points can make
+// intervals look visually flattened. This display-only reducer keeps first/last
+// points and the min/max power points inside each bucket, preserving spikes and
+// step changes while rendering like the original app's compact chart.
+const prepareRideChartForDisplay = (points, maxVisualPoints = 700) => {
+  if (!Array.isArray(points) || points.length === 0) return [];
+  if (points.length <= maxVisualPoints) return points;
+
+  const bucketSize = Math.ceil(points.length / Math.max(1, Math.floor(maxVisualPoints / 4)));
+  const reduced = [];
+  const addUnique = (point) => {
+    if (!point) return;
+    const last = reduced[reduced.length - 1];
+    if (!last || last.time !== point.time || last.watts !== point.watts || last.hr !== point.hr || last.cadence !== point.cadence) {
+      reduced.push(point);
+    }
+  };
+
+  for (let i = 0; i < points.length; i += bucketSize) {
+    const bucket = points.slice(i, i + bucketSize).map((point, localIndex) => ({ ...point, __idx: i + localIndex }));
+    if (bucket.length === 0) continue;
+
+    const minPowerPoint = bucket.reduce((min, point) => (Number(point.watts) || 0) < (Number(min.watts) || 0) ? point : min, bucket[0]);
+    const maxPowerPoint = bucket.reduce((max, point) => (Number(point.watts) || 0) > (Number(max.watts) || 0) ? point : max, bucket[0]);
+    const minHrPoint = bucket.reduce((min, point) => (Number(point.hr) || 0) < (Number(min.hr) || 0) ? point : min, bucket[0]);
+    const maxHrPoint = bucket.reduce((max, point) => (Number(point.hr) || 0) > (Number(max.hr) || 0) ? point : max, bucket[0]);
+
+    [bucket[0], minPowerPoint, maxPowerPoint, minHrPoint, maxHrPoint, bucket[bucket.length - 1]]
+      .sort((a, b) => a.__idx - b.__idx)
+      .forEach(({ __idx, ...point }) => addUnique(point));
+  }
+
+  return reduced;
+};
+
+
+const groupSamplesByRideId = (samples = []) => (samples || []).reduce((acc, sample) => {
+  if (!acc[sample.ride_id]) acc[sample.ride_id] = [];
+  acc[sample.ride_id].push(sample);
+  return acc;
+}, {});
+
+// Supabase/PostgREST can return a limited number of rows per request. A full FIT stream
+// can be thousands of samples per ride, so a single .select().in(...) can silently load
+// only the first page. Fetch samples per ride in pages so Block Analysis and Selected Ride
+// charts use the complete ride stream.
+const fetchRideSamplesByRideIds = async (rideIds = []) => {
+  if (!supabase || !Array.isArray(rideIds) || rideIds.length === 0) return {};
+
+  const samplesByRideId = {};
+  const pageSize = 1000;
+
+  for (const rideId of rideIds) {
+    let from = 0;
+    let keepGoing = true;
+    const rideSamples = [];
+
+    while (keepGoing) {
+      const to = from + pageSize - 1;
+      const { data, error } = await supabase
+        .from('ride_samples')
+        .select('*')
+        .eq('ride_id', rideId)
+        .order('sample_index', { ascending: true })
+        .range(from, to);
+
+      if (error) throw error;
+
+      const batch = data || [];
+      rideSamples.push(...batch);
+      keepGoing = batch.length === pageSize;
+      from += pageSize;
+    }
+
+    samplesByRideId[rideId] = rideSamples;
+  }
+
+  return samplesByRideId;
+};
+
+const LONG_TERM_METRIC_CONFIG = [
+  { key: 'tss', label: 'TSS', suffix: '', axis: 'left', chartType: 'bar', color: '#bfdbfe' },
+  { key: 'duration', label: 'Duration', suffix: 'h', axis: 'left', chartType: 'line', color: '#64748b' },
+  { key: 'avgPower', label: 'Avg Power', suffix: 'W', axis: 'right', chartType: 'line', color: '#2563eb' },
+  { key: 'normalizedPower', label: 'NP', suffix: 'W', axis: 'right', chartType: 'line', color: '#3b82f6' },
+  { key: 'variabilityIndex', label: 'VI', suffix: '', axis: 'right', chartType: 'line', color: '#8b5cf6' },
+  { key: 'avgHr', label: 'Avg HR', suffix: ' bpm', axis: 'right', chartType: 'line', color: '#ef4444' },
+  { key: 'decoupling', label: 'P:HR', suffix: '%', axis: 'right', chartType: 'line', color: '#10b981' },
+  { key: 'avgCadence', label: 'Cadence', suffix: ' rpm', axis: 'right', chartType: 'line', color: '#f59e0b' },
+  { key: 'maxPower', label: 'Max Power', suffix: 'W', axis: 'right', chartType: 'line', color: '#1d4ed8' },
+  { key: 'maxHr', label: 'Max HR', suffix: ' bpm', axis: 'right', chartType: 'line', color: '#dc2626' },
+  { key: 'kj', label: 'kJ', suffix: '', axis: 'left', chartType: 'line', color: '#0f766e' },
+  { key: 'wkg', label: 'W/kg', suffix: '', axis: 'right', chartType: 'line', color: '#7c3aed' },
+  { key: 'recovery', label: 'Recovery', suffix: '%', axis: 'right', chartType: 'line', color: '#22c55e' },
+  { key: 'sleepHours', label: 'Sleep', suffix: 'h', axis: 'right', chartType: 'line', color: '#06b6d4' },
+  { key: 'hrv', label: 'HRV', suffix: '', axis: 'right', chartType: 'line', color: '#14b8a6' },
+  { key: 'restingHr', label: 'RHR', suffix: ' bpm', axis: 'right', chartType: 'line', color: '#f97316' }
+];
+
+const formatMetricValue = (value, suffix = '') => {
+  if (value === null || value === undefined || value === '' || Number.isNaN(Number(value))) return 'N/A';
+  const numeric = Number(value);
+  const formatted = Math.abs(numeric) < 10 && !Number.isInteger(numeric) ? numeric.toFixed(2) : numeric.toFixed(numeric % 1 === 0 ? 0 : 1);
+  return `${formatted}${suffix}`;
+};
+
+const LongTermTooltip = ({ active, payload }) => {
+  if (!active || !payload || payload.length === 0) return null;
+  const data = payload[0]?.payload || {};
+  const metrics = [
+    ['TSS', formatMetricValue(data.tss)],
+    ['Duration', formatMetricValue(data.duration, 'h')],
+    ['Pwr', formatMetricValue(data.avgPower, 'W')],
+    ['NP', formatMetricValue(data.normalizedPower, 'W')],
+    ['VI', formatMetricValue(data.variabilityIndex)],
+    ['Cad', formatMetricValue(data.avgCadence, ' rpm')],
+    ['HR', formatMetricValue(data.avgHr, ' bpm')],
+    ['P:HR', formatMetricValue(data.decoupling, '%')],
+    ['Max Pwr', formatMetricValue(data.maxPower, 'W')],
+    ['Max HR', formatMetricValue(data.maxHr, ' bpm')],
+    ['kJ', formatMetricValue(data.kj)],
+    ['W/kg', formatMetricValue(data.wkg)],
+    ['Recovery', formatMetricValue(data.recovery, '%')],
+    ['Sleep', formatMetricValue(data.sleepHours, 'h')],
+    ['HRV', formatMetricValue(data.hrv)],
+    ['RHR', formatMetricValue(data.restingHr, ' bpm')]
+  ];
+
+  return (
+    <div className="bg-white rounded-xl border border-slate-200 shadow-xl p-3 min-w-[260px]">
+      <p className="text-[10px] uppercase tracking-widest font-black text-slate-400 mb-1">Ride Metrics</p>
+      <p className="text-sm font-black text-slate-900 mb-2">{data.date}</p>
+      <div className="grid grid-cols-3 gap-2">
+        {metrics.map(([label, value]) => (
+          <div key={label} className="bg-slate-50 rounded-lg p-2 border border-slate-100">
+            <p className="text-[8px] uppercase font-bold text-slate-400">{label}</p>
+            <p className="text-[11px] font-black text-slate-800">{value}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+
+// Full selected ride chart: preserve true elapsed minutes from ride_samples.
+// If an older display reducer accidentally compressed the x-axis to point-index time
+// (e.g., a 1.4h ride showing as 4 minutes), rescale only the x-axis back to ride duration.
+const prepareSelectedRideDetailData = (points, durationHours = 0) => {
+  if (!Array.isArray(points) || points.length === 0) return [];
+
+  const durationMinutes = Number(durationHours) > 0 ? Number(durationHours) * 60 : 0;
+  const sorted = [...points]
+    .filter(point => Number.isFinite(Number(point.time)))
+    .sort((a, b) => Number(a.time) - Number(b.time));
+
+  if (sorted.length === 0) return [];
+
+  const maxTime = Math.max(...sorted.map(point => Number(point.time) || 0));
+  if (durationMinutes > 10 && maxTime > 0 && maxTime < durationMinutes * 0.5) {
+    console.warn('Selected ride appears to have incomplete loaded samples. Not rescaling time; check sample pagination.', {
+      durationMinutes,
+      maxLoadedMinute: maxTime,
+      loadedPoints: sorted.length
+    });
+  }
+
+  return sorted.map(point => ({
+    time: Number(Number(point.time || 0).toFixed(2)),
+    watts: Number(point.watts) || 0,
+    hr: Number(point.hr) || 0,
+    cadence: Number(point.cadence) || 0,
+    target: Number(point.target) || 0
+  }));
+};
+
+const calculateSegmentNpFromChartPoints = (points) => {
+  if (!Array.isArray(points) || points.length < 30) return 0;
+  let pwr4thSum = 0;
+  let validWindows = 0;
+  for (let i = 0; i <= points.length - 30; i++) {
+    let windowSum = 0;
+    for (let j = 0; j < 30; j++) windowSum += Number(points[i + j].watts) || 0;
+    const rollingAvg = windowSum / 30;
+    if (rollingAvg > 0) {
+      pwr4thSum += Math.pow(rollingAvg, 4);
+      validWindows++;
+    }
+  }
+  return validWindows > 0 ? Math.pow(pwr4thSum / validWindows, 0.25) : 0;
+};
+
+const calculateSegmentDecoupling = (points) => {
+  if (!Array.isArray(points) || points.length < 20) return null;
+  const usable = points.filter(p => (Number(p.watts) || 0) > 0 && (Number(p.hr) || 0) > 0);
+  if (usable.length < 20) return null;
+  const mid = Math.floor(usable.length / 2);
+  const first = usable.slice(0, mid);
+  const second = usable.slice(mid);
+  const avg = (arr, key) => arr.reduce((sum, p) => sum + (Number(p[key]) || 0), 0) / arr.length;
+  const ef1 = avg(first, 'watts') / avg(first, 'hr');
+  const ef2 = avg(second, 'watts') / avg(second, 'hr');
+  return ef1 > 0 ? ((ef1 - ef2) / ef1) * 100 : null;
+};
+
+const calculateSelectedRideMetrics = (points, fallbackRide = {}) => {
+  const safePoints = Array.isArray(points) ? points : [];
+  const activePower = safePoints.filter(p => (Number(p.watts) || 0) > 0);
+  const activeHr = safePoints.filter(p => (Number(p.hr) || 0) > 0);
+  const activeCadence = safePoints.filter(p => (Number(p.cadence) || 0) > 0);
+  const avg = (arr, key) => arr.length ? arr.reduce((sum, p) => sum + (Number(p[key]) || 0), 0) / arr.length : 0;
+  const avgPower = avg(activePower, 'watts') || Number(fallbackRide.watts) || 0;
+  const avgHr = avg(activeHr, 'hr') || Number(fallbackRide.hr) || 0;
+  const avgCadence = avg(activeCadence, 'cadence') || Number(fallbackRide.cadence) || 0;
+  const np = calculateSegmentNpFromChartPoints(safePoints) || Number(fallbackRide.np) || avgPower;
+  const vi = avgPower > 0 ? np / avgPower : Number(fallbackRide.vi) || 0;
+  const decoupling = calculateSegmentDecoupling(safePoints);
+  const durationMinutes = safePoints.length > 1
+    ? Math.max(0, (Number(safePoints[safePoints.length - 1].time) || 0) - (Number(safePoints[0].time) || 0))
+    : 0;
+
+  return {
+    avgPower: Math.round(avgPower),
+    np: Math.round(np),
+    vi: vi ? Number(vi.toFixed(2)) : null,
+    cadence: avgCadence ? Math.round(avgCadence) : null,
+    hr: avgHr ? Math.round(avgHr) : null,
+    decoupling: decoupling !== null && Number.isFinite(decoupling) ? Number(decoupling.toFixed(1)) : (Number(fallbackRide.decoupling) || 0),
+    durationMinutes: Number(durationMinutes.toFixed(1))
+  };
+};
 
 const compressRideTimeline = (dataPoints, gapThresholdSeconds = 15) => {
   if (!Array.isArray(dataPoints) || dataPoints.length === 0) return [];
@@ -184,6 +397,7 @@ const compressRideTimeline = (dataPoints, gapThresholdSeconds = 15) => {
 const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => {
   const [rides, setRides] = useState([]);
   const [blocks, setBlocks] = useState([]);
+  const [whoopMetrics, setWhoopMetrics] = useState([]);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [selectionStart, setSelectionStart] = useState(null);
@@ -194,6 +408,7 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
   const [compareBlockBId, setCompareBlockBId] = useState('');
   const [longTermAnalysis, setLongTermAnalysis] = useState('');
   const [isLongTermAnalyzing, setIsLongTermAnalyzing] = useState(false);
+  const [selectedMetricKeys, setSelectedMetricKeys] = useState(['tss', 'normalizedPower', 'avgHr', 'decoupling']);
 
   useEffect(() => {
     const loadRidesAndBlocks = async () => {
@@ -204,24 +419,31 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
       if (!riderId) {
         setRides([]);
         setBlocks([]);
+        setWhoopMetrics([]);
         return;
       }
 
       setLoading(true);
       setErrorMessage('');
 
-      const [{ data: rideData, error: rideError }, { data: blockData, error: blockError }] = await Promise.all([
+      const [
+        { data: rideData, error: rideError },
+        { data: blockData, error: blockError },
+        { data: whoopDataRows, error: whoopError }
+      ] = await Promise.all([
         supabase.from('rides').select('*').eq('rider_id', riderId).order('ride_date', { ascending: true }),
-        supabase.from('training_blocks').select('*').eq('rider_id', riderId).order('start_date', { ascending: true })
+        supabase.from('training_blocks').select('*').eq('rider_id', riderId).order('start_date', { ascending: true }),
+        supabase.from('whoop_metrics').select('*').eq('rider_id', riderId).order('metric_date', { ascending: true })
       ]);
 
-      if (rideError || blockError) {
-        const error = rideError || blockError;
+      if (rideError || blockError || whoopError) {
+        const error = rideError || blockError || whoopError;
         console.error('Long-term load failed:', error);
         setErrorMessage(error.message);
       } else {
         setRides(rideData || []);
         setBlocks(blockData || []);
+        setWhoopMetrics(whoopDataRows || []);
       }
 
       setLoading(false);
@@ -230,16 +452,49 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
     loadRidesAndBlocks();
   }, [riderId]);
 
-  const chartData = useMemo(() => rides.map(ride => ({
-    date: ride.ride_date,
-    tss: Number(ride.tss) || 0,
-    avgPower: Number(ride.avg_power) || 0,
-    normalizedPower: Number(ride.normalized_power) || 0,
-    variabilityIndex: Number(ride.variability_index) || 0,
-    avgHr: Number(ride.avg_hr) || 0,
-    decoupling: Number(ride.decoupling) || 0,
-    duration: Number(ride.duration_hours) || 0
-  })), [rides]);
+  const chartData = useMemo(() => {
+    const whoopByDate = (whoopMetrics || []).reduce((acc, row) => {
+      if (!row.metric_date) return acc;
+      acc[row.metric_date] = row;
+      return acc;
+    }, {});
+
+    return rides.map(ride => {
+      const whoop = whoopByDate[ride.ride_date] || {};
+      return {
+        date: ride.ride_date,
+        tss: Number(ride.tss) || 0,
+        avgPower: Number(ride.avg_power) || 0,
+        normalizedPower: Number(ride.normalized_power) || 0,
+        variabilityIndex: Number(ride.variability_index) || 0,
+        avgHr: Number(ride.avg_hr) || 0,
+        decoupling: Number(ride.decoupling) || 0,
+        duration: Number(ride.duration_hours) || 0,
+        avgCadence: Number(ride.avg_cadence || ride.cadence) || 0,
+        maxPower: Number(ride.max_power) || 0,
+        maxHr: Number(ride.max_hr) || 0,
+        kj: Number(ride.kj) || 0,
+        wkg: Number(ride.wkg) || 0,
+        recovery: Number(whoop.recovery) || null,
+        sleepHours: Number(whoop.sleep_hours) || null,
+        hrv: Number(whoop.hrv) || null,
+        restingHr: Number(whoop.resting_hr) || null
+      };
+    });
+  }, [rides, whoopMetrics]);
+
+  const selectedMetricConfigs = useMemo(() => (
+    LONG_TERM_METRIC_CONFIG.filter(metric => selectedMetricKeys.includes(metric.key))
+  ), [selectedMetricKeys]);
+
+  const toggleLongTermMetric = (metricKey) => {
+    setSelectedMetricKeys(prev => {
+      if (prev.includes(metricKey)) {
+        return prev.length === 1 ? prev : prev.filter(key => key !== metricKey);
+      }
+      return [...prev, metricKey];
+    });
+  };
 
   const displayedChartData = useMemo(() => {
     if (!activeRange) return chartData;
@@ -298,6 +553,51 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
     return block ? { block, metrics: summarizeRides(getBlockRides(compareBlockBId)) } : null;
   }, [compareBlockBId, blocks, rides]);
 
+  const getBlockChartData = (blockId) => {
+    const block = blocks.find(b => b.id === blockId);
+    if (!block) return [];
+    return chartData.filter(point => point.date >= block.start_date && point.date <= block.end_date);
+  };
+
+  const comparisonChartAData = useMemo(() => getBlockChartData(compareBlockAId), [compareBlockAId, blocks, chartData]);
+  const comparisonChartBData = useMemo(() => getBlockChartData(compareBlockBId), [compareBlockBId, blocks, chartData]);
+  const hasTwoBlockComparison = comparisonChartAData.length > 0 && comparisonChartBData.length > 0;
+
+  const sharedComparisonDomains = useMemo(() => {
+    const combined = [...comparisonChartAData, ...comparisonChartBData];
+    const leftKeys = selectedMetricConfigs.filter(metric => metric.axis === 'left').map(metric => metric.key);
+    const rightKeys = selectedMetricConfigs.filter(metric => metric.axis === 'right').map(metric => metric.key);
+    const maxLeft = Math.max(10, ...combined.flatMap(d => leftKeys.map(key => Number(d[key]) || 0)));
+    const maxRight = Math.max(10, ...combined.flatMap(d => rightKeys.map(key => Number(d[key]) || 0)));
+    return { left: [0, Math.ceil(maxLeft * 1.15)], right: [0, Math.ceil(maxRight * 1.15)] };
+  }, [comparisonChartAData, comparisonChartBData, selectedMetricConfigs]);
+
+  const renderBlockComparisonChart = (data, block, label) => (
+    <div className="rounded-xl border border-slate-200 bg-white p-4">
+      <div className="mb-3">
+        <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">{label}</p>
+        <h4 className="text-sm font-black text-slate-800">{block?.block_name || block?.block_type || 'Training Block'}</h4>
+        <p className="text-[10px] font-bold uppercase text-slate-400">{block?.start_date} → {block?.end_date} · {block?.block_type || 'Unclassified'}</p>
+      </div>
+      <div className="h-[300px]">
+        <ResponsiveContainer width="100%" height="100%">
+          <ComposedChart data={data} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+            <XAxis dataKey="date" tick={{ fontSize: 10 }} />
+            <YAxis yAxisId="left" tick={{ fontSize: 10 }} domain={sharedComparisonDomains.left} />
+            <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 10 }} domain={sharedComparisonDomains.right} />
+            <RechartsTooltip content={<LongTermTooltip />} />
+            {selectedMetricConfigs.map(metric => metric.chartType === 'bar' ? (
+              <Bar key={metric.key} yAxisId={metric.axis} dataKey={metric.key} name={metric.label} fill={metric.color} radius={[4, 4, 0, 0]} />
+            ) : (
+              <Line key={metric.key} yAxisId={metric.axis} type="linear" dataKey={metric.key} name={metric.label} stroke={metric.color} strokeWidth={2} dot={false} />
+            ))}
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+
   const handleMouseDown = (event) => {
     if (!event?.activeLabel) return;
     setSelectionStart(event.activeLabel);
@@ -350,17 +650,23 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
 
   const handleCompareBlockASelect = (blockId) => {
     setCompareBlockAId(blockId);
-    focusChartOnBlocks(blockId, compareBlockBId);
+    if (blockId === compareBlockBId) setCompareBlockBId('');
+    focusChartOnBlocks(blockId, blockId === compareBlockBId ? '' : compareBlockBId);
   };
 
   const handleCompareBlockBSelect = (blockId) => {
+    if (blockId === compareBlockAId) return;
     setCompareBlockBId(blockId);
     focusChartOnBlocks(compareBlockAId, blockId);
   };
 
   const formatLongTermRidesForAi = (rideList) => {
     if (!rideList.length) return 'No rides are visible in the current Long-Term View.';
-    return rideList.map(ride => `- ${ride.ride_date} | ${ride.name || 'Ride'} | Duration: ${ride.duration_hours || 'N/A'}h | TSS: ${ride.tss || 'N/A'} | Avg Power: ${ride.avg_power || 'N/A'}W | NP: ${ride.normalized_power || 'N/A'}W | VI: ${ride.variability_index || 'N/A'} | Avg HR: ${ride.avg_hr || 'N/A'} bpm | Decoupling: ${ride.decoupling || 'N/A'}%`).join('\n');
+    return rideList.map(ride => {
+      const whoop = (whoopMetrics || []).find(row => row.metric_date === ride.ride_date) || {};
+      const whoopContext = whoop.metric_date ? ` | Recovery: ${whoop.recovery ?? 'N/A'}% | Sleep: ${whoop.sleep_hours ?? 'N/A'}h | HRV: ${whoop.hrv ?? 'N/A'} | RHR: ${whoop.resting_hr ?? 'N/A'} bpm` : '';
+      return `- ${ride.ride_date} | ${ride.name || 'Ride'} | Duration: ${ride.duration_hours || 'N/A'}h | TSS: ${ride.tss || 'N/A'} | Avg Power: ${ride.avg_power || 'N/A'}W | NP: ${ride.normalized_power || 'N/A'}W | VI: ${ride.variability_index || 'N/A'} | Avg HR: ${ride.avg_hr || 'N/A'} bpm | Decoupling: ${ride.decoupling || 'N/A'}%${whoopContext}`;
+    }).join('\n');
   };
 
   const formatVisibleBlocksForAi = () => {
@@ -441,7 +747,7 @@ CRITICAL DATA RULES:
           <div>
             <h2 className="text-3xl font-black text-slate-900 font-serif">Long-Term Rider View</h2>
             <p className="text-sm text-slate-500 mt-1">
-              {riderName ? `${riderName} · ` : ''}Drag across the chart, select a saved block, or compare two blocks.
+              {riderName ? `${riderName} · ` : ''}Drag across the chart or compare two saved training blocks.
             </p>
             {activeRange && <p className="text-xs font-bold text-blue-600 mt-2 uppercase">Selected: {activeRange.start} to {activeRange.end}</p>}
           </div>
@@ -455,27 +761,47 @@ CRITICAL DATA RULES:
           </div>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 no-print">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6 no-print">
           <div>
-            <label className="text-[10px] font-bold text-slate-400 uppercase">Select Saved Block</label>
-            <select className="w-full mt-1 p-2 border border-slate-200 rounded-lg text-sm bg-slate-50" value={selectedBlockId} onChange={(e) => handleBlockSelect(e.target.value)}>
-              <option value="">Manual range / all rides</option>
+            <label className="text-[10px] font-bold text-slate-400 uppercase">Block to Compare</label>
+            <select className="w-full mt-1 p-2 border border-slate-200 rounded-lg text-sm bg-slate-50" value={compareBlockAId} onChange={(e) => handleCompareBlockASelect(e.target.value)}>
+              <option value="">Select first block...</option>
               {blocks.map(block => <option key={block.id} value={block.id}>{block.start_date} to {block.end_date} · {block.block_type || 'Block'} · {block.block_name || 'Unnamed'}</option>)}
             </select>
           </div>
           <div>
-            <label className="text-[10px] font-bold text-slate-400 uppercase">Compare Block A</label>
-            <select className="w-full mt-1 p-2 border border-slate-200 rounded-lg text-sm bg-slate-50" value={compareBlockAId} onChange={(e) => handleCompareBlockASelect(e.target.value)}>
-              <option value="">Select block...</option>
-              {blocks.map(block => <option key={block.id} value={block.id}>{block.block_type || 'Block'} · {block.start_date}</option>)}
+            <label className="text-[10px] font-bold text-slate-400 uppercase">Compare Against</label>
+            <select className="w-full mt-1 p-2 border border-slate-200 rounded-lg text-sm bg-slate-50" value={compareBlockBId} onChange={(e) => handleCompareBlockBSelect(e.target.value)} disabled={!compareBlockAId}>
+              <option value="">Select second block...</option>
+              {blocks.filter(block => block.id !== compareBlockAId).map(block => <option key={block.id} value={block.id}>{block.start_date} to {block.end_date} · {block.block_type || 'Block'} · {block.block_name || 'Unnamed'}</option>)}
             </select>
           </div>
-          <div>
-            <label className="text-[10px] font-bold text-slate-400 uppercase">Compare Block B</label>
-            <select className="w-full mt-1 p-2 border border-slate-200 rounded-lg text-sm bg-slate-50" value={compareBlockBId} onChange={(e) => handleCompareBlockBSelect(e.target.value)}>
-              <option value="">Select block...</option>
-              {blocks.map(block => <option key={block.id} value={block.id}>{block.block_type || 'Block'} · {block.start_date}</option>)}
-            </select>
+        </div>
+
+        <div className="mb-6 no-print">
+          <div className="flex items-center justify-between mb-2">
+            <label className="text-[10px] font-bold text-slate-400 uppercase">Metrics Shown in Chart</label>
+            <button
+              onClick={() => setSelectedMetricKeys(['tss', 'normalizedPower', 'avgHr', 'decoupling'])}
+              className="text-[10px] font-black uppercase text-blue-600 hover:text-blue-800"
+            >
+              Reset Metrics
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {LONG_TERM_METRIC_CONFIG.map(metric => {
+              const selected = selectedMetricKeys.includes(metric.key);
+              return (
+                <button
+                  key={metric.key}
+                  type="button"
+                  onClick={() => toggleLongTermMetric(metric.key)}
+                  className={`px-3 py-1.5 rounded-full border text-[10px] font-black uppercase transition ${selected ? 'bg-blue-50 border-blue-200 text-blue-700' : 'bg-white border-slate-200 text-slate-400 hover:bg-slate-50'}`}
+                >
+                  {metric.label}
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -484,6 +810,14 @@ CRITICAL DATA RULES:
           <p className="text-sm text-slate-500">Loading rides and saved blocks...</p>
         ) : displayedChartData.length === 0 ? (
           <p className="text-sm text-slate-500">No rides found in Supabase for this rider yet.</p>
+        ) : hasTwoBlockComparison ? (
+          <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto_1fr] gap-4 items-stretch">
+            {renderBlockComparisonChart(comparisonChartAData, compareA?.block, 'Block A')}
+            <div className="hidden lg:flex items-center justify-center">
+              <div className="h-full w-px bg-slate-200" />
+            </div>
+            {renderBlockComparisonChart(comparisonChartBData, compareB?.block, 'Block B')}
+          </div>
         ) : (
           <div className="h-[420px] select-none">
             <ResponsiveContainer width="100%" height="100%">
@@ -498,14 +832,15 @@ CRITICAL DATA RULES:
                 <XAxis dataKey="date" tick={{ fontSize: 11 }} />
                 <YAxis yAxisId="left" tick={{ fontSize: 11 }} />
                 <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} />
-                <RechartsTooltip />
+                <RechartsTooltip content={<LongTermTooltip />} />
                 {blocks.map((block) => (
                   <ReferenceArea key={block.id} yAxisId="left" x1={block.start_date} x2={block.end_date} strokeOpacity={0.15} fillOpacity={0.08} label={{ value: block.block_type || 'Block', position: 'insideTop', fontSize: 10 }} />
                 ))}
-                <Bar yAxisId="left" dataKey="tss" name="TSS" fill="#bfdbfe" radius={[4, 4, 0, 0]} />
-                <Line yAxisId="right" type="monotone" dataKey="decoupling" name="Decoupling %" stroke="#10b981" strokeWidth={2} dot={false} />
-                <Line yAxisId="right" type="monotone" dataKey="avgHr" name="Avg HR" stroke="#ef4444" strokeWidth={2} dot={false} />
-                <Line yAxisId="right" type="monotone" dataKey="normalizedPower" name="Normalized Power" stroke="#3b82f6" strokeWidth={2} dot={false} />
+                {selectedMetricConfigs.map(metric => metric.chartType === 'bar' ? (
+                  <Bar key={metric.key} yAxisId={metric.axis} dataKey={metric.key} name={metric.label} fill={metric.color} radius={[4, 4, 0, 0]} />
+                ) : (
+                  <Line key={metric.key} yAxisId={metric.axis} type="linear" dataKey={metric.key} name={metric.label} stroke={metric.color} strokeWidth={2} dot={false} />
+                ))}
                 {selectionStart && selectionEnd && (
                   <ReferenceArea yAxisId="left" x1={selectionStart} x2={selectionEnd} strokeOpacity={0.25} />
                 )}
@@ -605,6 +940,11 @@ const MetricCard = ({ label, value }) => (
 );
 
 const App = () => {
+  const [authSession, setAuthSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState('');
   const [view, setView] = useState('onboarding'); // 'onboarding', 'report', 'admin', 'profile'
   
   // Importer UI States
@@ -680,10 +1020,61 @@ const App = () => {
   const [analysisBlockName, setAnalysisBlockName] = useState('');
   const [savedAnalysisBlocks, setSavedAnalysisBlocks] = useState([]);
   const [selectedAnalysisBlockId, setSelectedAnalysisBlockId] = useState('');
+  const [selectedBlockRide, setSelectedBlockRide] = useState(null);
+  const [selectedRideZoomRange, setSelectedRideZoomRange] = useState(null);
+  const [selectedRideZoomStart, setSelectedRideZoomStart] = useState(null);
+  const [selectedRideZoomEnd, setSelectedRideZoomEnd] = useState(null);
   const [isLoadingBlock, setIsLoadingBlock] = useState(false);
   const [isSavingBlock, setIsSavingBlock] = useState(false);
   const blockTypeOptions = ["VO2", "Tempo", "Recovery", "Zone 2", "Endurance", "Threshold", "Race Prep", "Custom"];
   const reasonOptions = ["Rest Day", "Sick", "No time", "Not motivated", "Travel", "Other"];
+
+  useEffect(() => {
+    if (!supabase) {
+      setAuthLoading(false);
+      return;
+    }
+
+    supabase.auth.getSession().then(({ data }) => {
+      setAuthSession(data?.session || null);
+      setAuthLoading(false);
+    });
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setAuthSession(session || null);
+      setAuthLoading(false);
+    });
+
+    return () => authListener?.subscription?.unsubscribe?.();
+  }, []);
+
+  const handleAuthSignIn = async (e) => {
+    e.preventDefault();
+    if (!supabase) {
+      setAuthError('Supabase is not configured.');
+      return;
+    }
+    setAuthError('');
+    setAuthLoading(true);
+
+    const { error } = await supabase.auth.signInWithPassword({
+      email: authEmail.trim(),
+      password: authPassword
+    });
+
+    if (error) {
+      setAuthError(error.message);
+      setAuthLoading(false);
+    }
+  };
+
+  const handleAuthSignOut = async () => {
+    if (!supabase) return;
+    await supabase.auth.signOut();
+    setAuthSession(null);
+    setSelectedRosterId('');
+    resetSessionData();
+  };
 
   // --- Persistence Hooks ---
   useEffect(() => {
@@ -758,6 +1149,7 @@ const App = () => {
     setContextStatus('idle');
     setWhoopStatus('idle');
     setClosingStatement("");
+    setSelectedBlockRide(null);
     setChatMessages([
       { role: 'assistant', content: "Hey, Andrew here. I've got your latest block data loaded up alongside the Sans Chaine knowledge base. Let me know what you want to dig into." }
     ]);
@@ -862,6 +1254,25 @@ const App = () => {
     }
   };
 
+
+  const getActiveRiderDatabaseId = () => riderData?.supabaseId || selectedRosterId || riderData?.id || '';
+
+  useEffect(() => {
+    const activeRiderId = getActiveRiderDatabaseId();
+    if (!activeRiderId) {
+      setSavedAnalysisBlocks([]);
+      return;
+    }
+    loadSavedAnalysisBlocksForRider(activeRiderId);
+  }, [riderData?.supabaseId, riderData?.id, selectedRosterId]);
+
+  useEffect(() => {
+    if (view !== 'report') return;
+    const activeRiderId = getActiveRiderDatabaseId();
+    if (!activeRiderId) return;
+    loadSavedAnalysisBlocksForRider(activeRiderId);
+  }, [view, riderData?.supabaseId, riderData?.id, selectedRosterId]);
+
   const startNewAnalysisBlock = () => {
     setSelectedAnalysisBlockId('');
     setAnalysisBlockStart('');
@@ -869,6 +1280,7 @@ const App = () => {
     setAnalysisBlockType('');
     setAnalysisBlockName('');
     setClosingStatement('');
+    setSelectedBlockRide(null);
     setPerformanceData([]);
     setRawRides([]);
     setCollapsedWeeks({});
@@ -931,23 +1343,8 @@ const App = () => {
       if (ridesError) throw ridesError;
 
       const rideIds = (dbRides || []).map(ride => ride.id);
-      let samplesByRideId = {};
-
-      if (rideIds.length > 0) {
-        const { data: dbSamples, error: samplesError } = await supabase
-          .from('ride_samples')
-          .select('*')
-          .in('ride_id', rideIds)
-          .order('sample_index', { ascending: true });
-
-        if (samplesError) throw samplesError;
-
-        samplesByRideId = (dbSamples || []).reduce((acc, sample) => {
-          if (!acc[sample.ride_id]) acc[sample.ride_id] = [];
-          acc[sample.ride_id].push(sample);
-          return acc;
-        }, {});
-      }
+      const samplesByRideId = await fetchRideSamplesByRideIds(rideIds);
+      console.log('Loaded ride sample counts:', Object.fromEntries(Object.entries(samplesByRideId).map(([id, samples]) => [id, samples.length])));
 
       const { data: dbWhoopMetrics, error: whoopMetricsError } = await supabase
         .from('whoop_metrics')
@@ -977,6 +1374,7 @@ const App = () => {
       const endDate = loadedRides[loadedRides.length - 1]?.date || athlete.endDate || startDate;
 
       setRawRides(loadedRides);
+      setSelectedBlockRide(loadedRides[0] || null);
       setWhoopData(loadedWhoopData);
       setDayReasons({});
       setCollapsedWeeks({});
@@ -1039,23 +1437,8 @@ const App = () => {
       if (ridesError) throw ridesError;
 
       const rideIds = (dbRides || []).map(ride => ride.id);
-      let samplesByRideId = {};
-
-      if (rideIds.length > 0) {
-        const { data: dbSamples, error: samplesError } = await supabase
-          .from('ride_samples')
-          .select('*')
-          .in('ride_id', rideIds)
-          .order('sample_index', { ascending: true });
-
-        if (samplesError) throw samplesError;
-
-        samplesByRideId = (dbSamples || []).reduce((acc, sample) => {
-          if (!acc[sample.ride_id]) acc[sample.ride_id] = [];
-          acc[sample.ride_id].push(sample);
-          return acc;
-        }, {});
-      }
+      const samplesByRideId = await fetchRideSamplesByRideIds(rideIds);
+      console.log('Loaded ride sample counts:', Object.fromEntries(Object.entries(samplesByRideId).map(([id, samples]) => [id, samples.length])));
 
       const { data: dbWhoopMetrics, error: whoopMetricsError } = await supabase
         .from('whoop_metrics')
@@ -1085,6 +1468,7 @@ const App = () => {
       const loadedRides = (dbRides || []).map(ride => convertDbRideToAppRide(ride, samplesByRideId[ride.id] || []));
 
       setRawRides(loadedRides);
+      setSelectedBlockRide(loadedRides[0] || null);
       setWhoopData(loadedWhoopData);
       setDayReasons({});
       setCollapsedWeeks({});
@@ -2148,7 +2532,7 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
               vi: vi,
               decoupling: parseFloat(decouplingCalc.toFixed(1)),
               chartData: chartData,
-              // Store the same reduced points used for charting. This keeps Supabase fast and avoids oversized inserts.
+              // Store the full compressed FIT record stream used for Block Analysis charts. Do not downsample here.
               sampleData: chartData.map((point, pointIndex) => ({
                   sample_index: pointIndex,
                   time_minutes: Number(point.time) || 0,
@@ -2182,32 +2566,104 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
       for (let k of keys) { if (lowerObj[k.toLowerCase()] !== undefined && lowerObj[k.toLowerCase()] !== "") return lowerObj[k.toLowerCase()]; } return null;
   };
 
+  const parseDurationToHours = (value) => {
+      if (value === null || value === undefined || value === '') return null;
+      const raw = String(value).trim();
+      if (!raw) return null;
+      if (raw.includes(':')) {
+          const parts = raw.split(':').map(v => parseFloat(v) || 0);
+          if (parts.length === 3) return parts[0] + parts[1] / 60 + parts[2] / 3600;
+          if (parts.length === 2) return parts[0] / 60 + parts[1] / 3600;
+      }
+      const numeric = parseFloat(raw);
+      if (Number.isNaN(numeric)) return null;
+      // TrainingPeaks exports TimeTotalInHours as hours. If a duration is clearly in minutes,
+      // normalize it back to hours.
+      return numeric > 24 ? numeric / 60 : numeric;
+  };
+
+  const normalizeDateString = (value) => {
+      if (!value) return '';
+      let raw = String(value).trim();
+      if (!raw) return '';
+      if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.slice(0, 10);
+      const d = new Date(raw);
+      if (!Number.isNaN(d.getTime())) {
+          return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      }
+      return raw;
+  };
+
   const parseContextFileContent = (csvText) => {
         const lines = csvText.replace(/^\uFEFF/, '').split(/\r?\n/);
         const headers = parseCSVRow(lines[0]).map(h => h.replace(/["']/g, '').trim());
-        const tpData = lines.slice(1).filter(l => l.trim()).map(line => {
-          const row = parseCSVRow(line); const obj = {}; headers.forEach((h, idx) => { obj[h] = (row[idx] || '').replace(/["']/g, '').trim(); }); return obj;
+        const tpData = lines.slice(1).filter(l => l.trim()).map((line, index) => {
+          const row = parseCSVRow(line); const obj = {}; headers.forEach((h, idx) => { obj[h] = (row[idx] || '').replace(/["']/g, '').trim(); });
+          const workoutDate = normalizeDateString(findValueIgnoreCase(obj, ['WorkoutDay', 'Date', 'Day']));
+          const durationHours = parseDurationToHours(findValueIgnoreCase(obj, ['TimeTotalInHours', 'Duration', 'PlannedDuration', 'TotalTime']));
+          const tssValue = parseFloat(findValueIgnoreCase(obj, ['TSS', 'Training Stress Score', 'Training Stress Score®']) || '');
+          return { ...obj, __index: index, __date: workoutDate, __duration: durationHours, __tss: Number.isNaN(tssValue) ? null : tssValue };
         });
 
-        const mergedRides = rawRides.map(ride => {
-            const potentialMatches = tpData.filter(tp => {
-                let tpDate = findValueIgnoreCase(tp, ['WorkoutDay', 'Date', 'Day']) || '';
-                if (tpDate.includes('/')) { const d = new Date(tpDate); if (!isNaN(d)) tpDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
-                return tpDate === ride.date;
-            });
-            let bestMatch = null; let minDiff = 0.5;
-            potentialMatches.forEach(match => {
-                const diff = Math.abs((parseFloat(findValueIgnoreCase(match, ['TimeTotalInHours', 'Duration'])) || 0) - ride.duration);
-                if (diff < minDiff) { minDiff = diff; bestMatch = match; }
-            });
-            if (bestMatch) {
-                const tpTSS = findValueIgnoreCase(bestMatch, ['TSS', 'Training Stress Score', 'Training Stress Score®']);
-                return { ...ride, name: bestMatch.Title || ride.name, summary: bestMatch.WorkoutDescription || "", coachComments: bestMatch.CoachComments || "", feeling: bestMatch.Feeling || "", rpe: bestMatch.Rpe || "", tss: (tpTSS && tpTSS !== "") ? Math.round(parseFloat(tpTSS)) : ride.tss, syncMethod: 'Verified by Day & Duration' };
+        // Important: do NOT let a TrainingPeaks workout title overwrite the wrong FIT trace.
+        // The previous logic allowed a 0.5 hour / 30 minute duration difference, which could
+        // make a smooth endurance file appear under an interval workout title. This made the
+        // chart look "generic" even when the samples were saved correctly.
+        const usedWorkoutIndexes = new Set();
+        const ridesByDate = [...rawRides].sort((a, b) => {
+          if (a.date !== b.date) return a.date.localeCompare(b.date);
+          return (Number(a.duration) || 0) - (Number(b.duration) || 0);
+        });
+
+        const mergedByRideKey = new Map();
+
+        ridesByDate.forEach(ride => {
+            const rideDuration = Number(ride.duration) || 0;
+            const rideTss = Number(ride.tss) || null;
+            const durationTolerance = Math.max(0.05, rideDuration * 0.08); // 3 min minimum or 8%
+
+            const candidates = tpData
+              .filter(tp => tp.__date === ride.date && !usedWorkoutIndexes.has(tp.__index))
+              .map(tp => {
+                const durationDiff = tp.__duration !== null ? Math.abs(tp.__duration - rideDuration) : 999;
+                const tssDiff = tp.__tss !== null && rideTss ? Math.abs(tp.__tss - rideTss) : 0;
+                const hasDurationMatch = durationDiff <= durationTolerance;
+                const hasTssMatch = tp.__tss === null || !rideTss || tssDiff <= Math.max(15, rideTss * 0.35);
+                const score = (durationDiff * 100) + (tssDiff * 0.35);
+                return { tp, durationDiff, tssDiff, hasDurationMatch, hasTssMatch, score };
+              })
+              .filter(c => c.hasDurationMatch && c.hasTssMatch)
+              .sort((a, b) => a.score - b.score);
+
+            const best = candidates[0];
+            if (best) {
+                usedWorkoutIndexes.add(best.tp.__index);
+                const bestMatch = best.tp;
+                const tpTSS = bestMatch.__tss;
+                mergedByRideKey.set(ride.id || `${ride.date}-${ride.duration}-${ride.name}`, {
+                  ...ride,
+                  name: bestMatch.Title || ride.name,
+                  summary: bestMatch.WorkoutDescription || '',
+                  coachComments: bestMatch.CoachComments || '',
+                  feeling: bestMatch.Feeling || '',
+                  rpe: bestMatch.Rpe || '',
+                  tss: (tpTSS !== null && tpTSS > 0 && tpTSS < 500) ? Math.round(tpTSS) : ride.tss,
+                  syncMethod: `Verified by Day & Duration (${Math.round(best.durationDiff * 60)}m diff)`,
+                  contextMatchConfidence: 'high'
+                });
+            } else {
+                mergedByRideKey.set(ride.id || `${ride.date}-${ride.duration}-${ride.name}`, {
+                  ...ride,
+                  syncMethod: 'No Context Match',
+                  contextMatchConfidence: 'none'
+                });
             }
-            return { ...ride, syncMethod: 'No Context Match' };
         });
 
-        setRawRides(mergedRides); setPerformanceData(generateWeeks(mergedRides, riderData.startingDate, riderData.endDate, whoopData)); setContextStatus('success');
+        const mergedRides = rawRides.map(ride => mergedByRideKey.get(ride.id || `${ride.date}-${ride.duration}-${ride.name}`) || ride);
+        setRawRides(mergedRides);
+        setPerformanceData(generateWeeks(mergedRides, riderData.startingDate, riderData.endDate, whoopData));
+        setContextStatus('success');
   };
 
   const handleContextImport = async (e) => {
@@ -2401,6 +2857,104 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
     </div>
   );
 
+  const handleSelectedRideSelect = (ride) => {
+    setSelectedBlockRide(ride);
+    setSelectedRideZoomRange(null);
+    setSelectedRideZoomStart(null);
+    setSelectedRideZoomEnd(null);
+  };
+
+  const handleSelectedRideMouseDown = (event) => {
+    if (event?.activeLabel === undefined || event?.activeLabel === null) return;
+    const start = Number(event.activeLabel);
+    if (Number.isNaN(start)) return;
+    setSelectedRideZoomStart(start);
+    setSelectedRideZoomEnd(null);
+  };
+
+  const handleSelectedRideMouseMove = (event) => {
+    if (selectedRideZoomStart === null || selectedRideZoomStart === undefined) return;
+    if (event?.activeLabel === undefined || event?.activeLabel === null) return;
+    const end = Number(event.activeLabel);
+    if (Number.isNaN(end)) return;
+    setSelectedRideZoomEnd(end);
+  };
+
+  const handleSelectedRideMouseUp = () => {
+    if (selectedRideZoomStart !== null && selectedRideZoomEnd !== null && selectedRideZoomEnd !== undefined) {
+      const start = Math.min(selectedRideZoomStart, selectedRideZoomEnd);
+      const end = Math.max(selectedRideZoomStart, selectedRideZoomEnd);
+      if (end - start > 0.25) {
+        setSelectedRideZoomRange({ start, end });
+      }
+    }
+    setSelectedRideZoomStart(null);
+    setSelectedRideZoomEnd(null);
+  };
+
+  const resetSelectedRideZoom = () => {
+    setSelectedRideZoomRange(null);
+    setSelectedRideZoomStart(null);
+    setSelectedRideZoomEnd(null);
+  };
+
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center">
+        <div className="text-center">
+          <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-xs font-black uppercase tracking-widest text-slate-400">Loading Sans Chaine</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!authSession) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
+        <form onSubmit={handleAuthSignIn} className="w-full max-w-md bg-white rounded-2xl shadow-2xl p-8 border border-slate-200">
+          <div className="mb-8">
+            <div className="w-12 h-12 bg-slate-900 rounded-xl flex items-center justify-center mb-4">
+              <ShieldCheck className="w-6 h-6 text-blue-400" />
+            </div>
+            <h1 className="text-3xl font-black text-slate-900 uppercase tracking-tighter">SANS CHAINE</h1>
+            <p className="text-sm text-slate-500 mt-1">Sign in to access rider data and coaching analysis.</p>
+          </div>
+
+          <div className="space-y-4">
+            <div>
+              <label className="text-[10px] font-black uppercase text-slate-400">Email</label>
+              <input
+                type="email"
+                value={authEmail}
+                onChange={(e) => setAuthEmail(e.target.value)}
+                className="w-full mt-1 p-3 border border-slate-200 rounded-lg text-sm outline-none focus:ring-2 focus:ring-blue-500"
+                autoComplete="email"
+                required
+              />
+            </div>
+            <div>
+              <label className="text-[10px] font-black uppercase text-slate-400">Password</label>
+              <input
+                type="password"
+                value={authPassword}
+                onChange={(e) => setAuthPassword(e.target.value)}
+                className="w-full mt-1 p-3 border border-slate-200 rounded-lg text-sm outline-none focus:ring-2 focus:ring-blue-500"
+                autoComplete="current-password"
+                required
+              />
+            </div>
+            {authError && <div className="bg-red-50 border border-red-100 text-red-700 text-sm rounded-lg p-3">{authError}</div>}
+            <button type="submit" className="w-full bg-blue-600 hover:bg-blue-700 text-white rounded-lg p-3 text-xs font-black uppercase tracking-wide">
+              Sign In
+            </button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-900 pb-20 overflow-x-hidden">
       <style>{`
@@ -2431,6 +2985,7 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
             <button onClick={() => setView('onboarding')} className={`px-4 py-2 text-xs font-bold uppercase rounded-md transition ${view === 'onboarding' ? 'bg-blue-600' : 'hover:bg-slate-800'}`}>Intake Sync</button>
             <button onClick={() => setView('longterm')} className={`px-4 py-2 text-xs font-bold uppercase rounded-md transition ${view === 'longterm' ? 'bg-emerald-600' : 'hover:bg-slate-800'}`}>Long-Term View</button>
             <button onClick={() => setView('report')} className={`px-4 py-2 text-xs font-bold uppercase rounded-md transition ${view === 'report' ? 'bg-blue-600' : 'hover:bg-slate-800'}`}>Block Analysis</button>
+            <button onClick={handleAuthSignOut} className="px-4 py-2 text-xs font-bold uppercase rounded-md transition text-slate-300 hover:bg-slate-800">Sign Out</button>
           </div>
         </div>
       </header>
@@ -2902,7 +3457,16 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
 
               <div className="grid grid-cols-1 md:grid-cols-6 gap-4 items-end">
                 <div>
-                  <label className="text-[10px] font-bold text-slate-400 uppercase">Saved Blocks</label>
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="text-[10px] font-bold text-slate-400 uppercase">Saved Blocks ({savedAnalysisBlocks.length})</label>
+                    <button
+                      type="button"
+                      onClick={() => loadSavedAnalysisBlocksForRider(getActiveRiderDatabaseId())}
+                      className="text-[10px] font-black uppercase text-slate-400 hover:text-blue-600"
+                    >
+                      Refresh
+                    </button>
+                  </div>
                   <select className="w-full mt-1 p-2 border border-slate-200 rounded text-sm outline-none focus:ring-1 focus:ring-blue-500 bg-slate-50" value={selectedAnalysisBlockId} onChange={(e) => handleSavedAnalysisBlockSelect(e.target.value)}>
                     <option value="">New / Manual Block</option>
                     {savedAnalysisBlocks.map(block => <option key={block.id} value={block.id}>{block.start_date} to {block.end_date} · {block.block_type || 'Block'} · {block.block_name || 'Unnamed'}</option>)}
@@ -3043,9 +3607,10 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                                         {day.rides.length > 0 ? (
                                             day.rides.map((ride, rIdx) => {
                                                 const tooltipAnchor = dIdx > 3 ? "right-0 origin-top-right" : "left-0 origin-top-left";
+                                                const rideDisplayChartData = prepareRideChartForDisplay(ride.chartData || [], 700);
                                                 return (
-                                                <div key={rIdx} className="group relative w-full hover:z-[100]">
-                                                    <div className={`w-full p-2 rounded-lg flex flex-col items-start justify-center transition-all border shadow-sm cursor-help ${ride.syncMethod === 'No Context Match' ? 'bg-white border-slate-300 text-slate-600' : 'bg-blue-600 text-white border-blue-600'} hover:scale-105`}>
+                                                <div key={rIdx} onClick={() => handleSelectedRideSelect(ride)} className={`group relative w-full hover:z-[100] ${selectedBlockRide?.id === ride.id ? 'ring-2 ring-blue-400 rounded-lg' : ''}`}>
+                                                    <div className={`w-full p-2 rounded-lg flex flex-col items-start justify-center transition-all border shadow-sm cursor-pointer ${ride.syncMethod === 'No Context Match' ? 'bg-white border-slate-300 text-slate-600' : 'bg-blue-600 text-white border-blue-600'} hover:scale-105`} title="Click to update the full ride chart below">
                                                         <div className="flex justify-between items-center w-full mb-1"><span className="text-[12px] font-black">{ride.tss} TSS</span><span className="text-[9px] font-bold opacity-80">{ride.duration}h</span></div>
                                                         <div className="flex justify-between items-center w-full mb-1 text-[9px] font-bold opacity-80"><span>NP {ride.np || 'N/A'}W</span><span>VI {ride.vi || 'N/A'}</span></div>
                                                         <div className="flex justify-between items-center w-full"><span className="text-[9px] font-bold opacity-80">{ride.watts}W</span><span className="text-[9px] font-bold opacity-80">{ride.hr}bpm</span></div>
@@ -3055,18 +3620,18 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                                                             <div><p className="text-sm font-black text-slate-900 leading-tight">{ride.name}</p><p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider">{ride.date} • {ride.duration}h</p></div>
                                                             <div className="text-right"><span className="text-[9px] bg-slate-100 text-slate-600 px-2 py-1 rounded font-black tracking-widest">{ride.syncMethod}</span></div>
                                                         </div>
-                                                        {ride.chartData && ride.chartData.length > 0 && (
-                                                        <div className="h-36 w-full mt-3 mb-3 bg-slate-50 rounded-lg p-2 border border-slate-100">
+                                                        {rideDisplayChartData && rideDisplayChartData.length > 0 && (
+                                                        <div className="h-40 w-full mt-3 mb-3 bg-slate-50 rounded-lg p-2 border border-slate-100">
                                                             <ResponsiveContainer width="100%" height="100%">
-                                                                <ComposedChart data={ride.chartData} margin={{ top: 5, right: 0, left: -25, bottom: 0 }}>
+                                                                <ComposedChart data={rideDisplayChartData} margin={{ top: 5, right: 0, left: -25, bottom: 0 }}>
                                                                     <XAxis dataKey="time" hide />
                                                                     <YAxis yAxisId="power" tick={{fontSize: 8}} stroke="#cbd5e1" axisLine={false} tickLine={false} domain={[0, 'dataMax + 50']} />
                                                                     <YAxis yAxisId="hr" hide domain={[50, 200]} />
                                                                     <RechartsTooltip contentStyle={{ fontSize: '10px', padding: '4px', borderRadius: '4px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} labelStyle={{ display: 'none' }} itemStyle={{ padding: 0, margin: 0 }} />
-                                                                    <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="target" stroke="#94a3b8" strokeDasharray="3 3" dot={false} strokeWidth={1.5} name="Target W" />
-                                                                    <Area isAnimationActive={false} yAxisId="power" type="linear" dataKey="watts" stroke="#3b82f6" fill="#eff6ff" strokeWidth={2} dot={false} name="Watts" />
-                                                                    <Line isAnimationActive={false} yAxisId="hr" type="linear" dataKey="hr" stroke="#ef4444" strokeWidth={1.5} dot={false} name="HR (bpm)" />
-                                                                    <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="cadence" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="Cadence" />
+                                                                    <Line isAnimationActive={false} yAxisId="power" type="monotone" dataKey="target" stroke="#94a3b8" strokeDasharray="3 3" dot={false} strokeWidth={1.5} name="Target W" />
+                                                                    <Area isAnimationActive={false} yAxisId="power" type="monotone" dataKey="watts" stroke="#3b82f6" fill="#eff6ff" strokeWidth={2} dot={false} name="Watts" />
+                                                                    <Line isAnimationActive={false} yAxisId="hr" type="monotone" dataKey="hr" stroke="#ef4444" strokeWidth={1.5} dot={false} name="HR (bpm)" />
+                                                                    <Line isAnimationActive={false} yAxisId="power" type="monotone" dataKey="cadence" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="Cadence" />
                                                                 </ComposedChart>
                                                             </ResponsiveContainer>
                                                         </div>
@@ -3114,6 +3679,80 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                 })}
                 </div>
             </Card>
+
+            {selectedBlockRide && (() => {
+                const selectedRideChartDataFull = prepareSelectedRideDetailData(selectedBlockRide.chartData || [], selectedBlockRide.duration);
+                const selectedRideDurationMinutes = Math.ceil((Number(selectedBlockRide.duration) || 0) * 60);
+                const selectedRideChartData = selectedRideZoomRange
+                  ? selectedRideChartDataFull.filter(point => Number(point.time) >= selectedRideZoomRange.start && Number(point.time) <= selectedRideZoomRange.end)
+                  : selectedRideChartDataFull;
+                const selectedRideXAxisDomain = selectedRideZoomRange
+                  ? [selectedRideZoomRange.start, selectedRideZoomRange.end]
+                  : [0, selectedRideDurationMinutes];
+                const selectedRideDisplayMetrics = calculateSelectedRideMetrics(selectedRideChartData, selectedBlockRide);
+                return (
+                <Card title="Selected Ride Detail" icon={Activity} subtitle="Click any ride card above to update this chart">
+                    <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-4">
+                        <div>
+                            <h4 className="text-xl font-black text-slate-900 leading-tight">{selectedBlockRide.name}</h4>
+                            <p className="text-xs text-slate-400 font-bold uppercase tracking-wider">{selectedBlockRide.date} • {selectedBlockRide.duration}h • {selectedBlockRide.syncMethod}</p>
+                        </div>
+                        <div className="grid grid-cols-3 md:grid-cols-6 gap-2 text-center min-w-[360px]">
+                            <div className="bg-slate-50 rounded-lg p-2 border border-slate-100"><p className="text-[8px] uppercase font-bold text-slate-400">Pwr</p><p className="text-sm font-black text-slate-700">{selectedRideDisplayMetrics.avgPower}W</p></div>
+                            <div className="bg-slate-50 rounded-lg p-2 border border-slate-100"><p className="text-[8px] uppercase font-bold text-slate-400">NP</p><p className="text-sm font-black text-slate-700">{selectedRideDisplayMetrics.np || 'N/A'}W</p></div>
+                            <div className="bg-slate-50 rounded-lg p-2 border border-slate-100"><p className="text-[8px] uppercase font-bold text-slate-400">VI</p><p className="text-sm font-black text-slate-700">{selectedRideDisplayMetrics.vi || 'N/A'}</p></div>
+                            <div className="bg-slate-50 rounded-lg p-2 border border-slate-100"><p className="text-[8px] uppercase font-bold text-slate-400">Cad</p><p className="text-sm font-black text-slate-700">{selectedRideDisplayMetrics.cadence || 'N/A'}</p></div>
+                            <div className="bg-slate-50 rounded-lg p-2 border border-slate-100"><p className="text-[8px] uppercase font-bold text-slate-400">HR</p><p className="text-sm font-black text-slate-700">{selectedRideDisplayMetrics.hr || 'N/A'}</p></div>
+                            <div className="bg-slate-50 rounded-lg p-2 border border-slate-100"><p className="text-[8px] uppercase font-bold text-slate-400">P:HR</p><p className={`text-sm font-black ${selectedRideDisplayMetrics.decoupling > 5 ? 'text-red-500' : 'text-green-600'}`}>{selectedRideDisplayMetrics.decoupling}%</p></div>
+                        </div>
+                    </div>
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3 rounded-lg bg-slate-50 border border-slate-100 px-3 py-2 no-print">
+                        <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                            Drag across the chart to zoom into an interval.
+                            {selectedRideZoomRange && <span className="ml-2 text-blue-600">Zoom: {selectedRideZoomRange.start.toFixed(1)}–{selectedRideZoomRange.end.toFixed(1)} min · Metrics reflect this range</span>}
+                        </p>
+                        <button
+                          onClick={resetSelectedRideZoom}
+                          disabled={!selectedRideZoomRange}
+                          className={`px-3 py-1.5 rounded-md text-[10px] font-black uppercase transition ${selectedRideZoomRange ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}
+                        >
+                          Reset Zoom
+                        </button>
+                    </div>
+                    {selectedRideChartData.length > 0 ? (
+                        <div className="h-[420px] w-full bg-slate-50 rounded-xl p-3 border border-slate-100">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <ComposedChart
+                                    data={selectedRideChartData}
+                                    margin={{ top: 10, right: 24, left: -10, bottom: 18 }}
+                                    onMouseDown={handleSelectedRideMouseDown}
+                                    onMouseMove={handleSelectedRideMouseMove}
+                                    onMouseUp={handleSelectedRideMouseUp}
+                                >
+                                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                                    <XAxis dataKey="time" type="number" domain={selectedRideXAxisDomain} allowDataOverflow tick={{ fontSize: 10 }} tickLine={false} axisLine={false} label={{ value: 'Minutes', position: 'insideBottomRight', offset: -5, fontSize: 10 }} />
+                                    <YAxis yAxisId="power" tick={{fontSize: 10}} stroke="#94a3b8" axisLine={false} tickLine={false} domain={[0, 'dataMax + 50']} />
+                                    <YAxis yAxisId="hr" orientation="right" tick={{fontSize: 10}} stroke="#ef4444" axisLine={false} tickLine={false} domain={[50, 200]} />
+                                    <RechartsTooltip contentStyle={{ fontSize: '11px', padding: '8px', borderRadius: '8px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }} labelFormatter={(label) => `${label} min`} />
+                                    <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="target" stroke="#94a3b8" strokeDasharray="3 3" dot={false} strokeWidth={1.5} name="Target W" />
+                                    <Area isAnimationActive={false} yAxisId="power" type="linear" dataKey="watts" stroke="#3b82f6" fill="#eff6ff" strokeWidth={1.8} dot={false} name="Watts" />
+                                    <Line isAnimationActive={false} yAxisId="hr" type="linear" dataKey="hr" stroke="#ef4444" strokeWidth={1.6} dot={false} name="HR (bpm)" />
+                                    <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="cadence" stroke="#f59e0b" strokeWidth={1.4} dot={false} name="Cadence" />
+                                    {selectedRideZoomStart !== null && selectedRideZoomEnd !== null && (
+                                      <ReferenceArea yAxisId="power" x1={selectedRideZoomStart} x2={selectedRideZoomEnd} strokeOpacity={0.25} fill="#bfdbfe" fillOpacity={0.25} />
+                                    )}
+                                </ComposedChart>
+                            </ResponsiveContainer>
+                        </div>
+                    ) : (
+                        <div className="p-6 rounded-xl bg-slate-50 border border-slate-100 text-sm text-slate-500">No chart data available for this ride.</div>
+                    )}
+                    {selectedBlockRide.summary && selectedBlockRide.summary !== "Technical data synced. Pending context matching..." && (
+                        <div className="mt-4 bg-blue-50 p-3 rounded-lg border border-blue-100"><p className="text-[9px] uppercase font-black text-blue-600 mb-1">Ride Purpose</p><p className="text-xs text-blue-900 italic leading-relaxed">{selectedBlockRide.summary}</p></div>
+                    )}
+                </Card>
+                );
+            })()}
 
             <Card title="Monthly Closing Statement & Coach's Eye" icon={CheckCircle2}>
                 {riderData.context && (
