@@ -99,21 +99,19 @@ const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
 
 // Keep the database chart samples aligned with the report chart.
-// For Block Analysis, the chart needs enough fidelity to show intervals.
-// Rule: save every parsed chart point unless the ride is extremely large; then evenly downsample.
-// This preserves the original local chart shape while avoiding oversized Supabase writes.
-const RIDE_CHART_SAMPLE_MAX_POINTS = 30000;
+// The original app did not store every timestamp; it reduced each ride to visual points.
+// 120 keeps interval charts readable without overwhelming Supabase.
+const RIDE_CHART_SAMPLE_TARGET = 120;
 
 const buildChartSamples = (dataPoints, avgWatts = 0) => {
   if (!Array.isArray(dataPoints) || dataPoints.length === 0) return [];
-
-  const step = Math.max(1, Math.ceil(dataPoints.length / RIDE_CHART_SAMPLE_MAX_POINTS));
+  const step = Math.max(1, Math.floor(dataPoints.length / RIDE_CHART_SAMPLE_TARGET));
   const samples = [];
 
   for (let i = 0; i < dataPoints.length; i += step) {
     const point = dataPoints[i];
     samples.push({
-      time: Number((Number(point.t || 0) / 60).toFixed(2)),
+      time: Number((point.t / 60).toFixed(2)),
       watts: Number(point.p) || 0,
       hr: Number(point.hr) || 0,
       cadence: Number(point.cad) || 0,
@@ -121,113 +119,48 @@ const buildChartSamples = (dataPoints, avgWatts = 0) => {
     });
   }
 
-  const lastPoint = dataPoints[dataPoints.length - 1];
-  const finalTime = Number((Number(lastPoint.t || 0) / 60).toFixed(2));
-  if (!samples.length || samples[samples.length - 1].time !== finalTime) {
-    samples.push({
-      time: finalTime,
-      watts: Number(lastPoint.p) || 0,
-      hr: Number(lastPoint.hr) || 0,
-      cadence: Number(lastPoint.cad) || 0,
-      target: Number(avgWatts) || 0
-    });
-  }
-
   return samples;
 };
 
-
-const compressRideTimeline = (dataPoints, gapThresholdSeconds = 15) => {
-  if (!Array.isArray(dataPoints) || dataPoints.length === 0) return [];
-
-  const sorted = [...dataPoints].sort((a, b) => {
-    const aKey = Number(a.timestampMs ?? a.t ?? 0);
-    const bKey = Number(b.timestampMs ?? b.t ?? 0);
-    return aKey - bKey;
-  });
-
-  let movingSeconds = 0;
-  let previousTimestamp = Number(sorted[0]?.timestampMs ?? 0);
-  let previousElapsed = Number(sorted[0]?.t ?? 0);
-
-  return sorted.map((point, index) => {
-    const timestampMs = Number(point.timestampMs ?? 0);
-    const elapsedSeconds = Number(point.t ?? 0);
-
-    if (index > 0) {
-      let deltaSeconds = 0;
-
-      if (timestampMs && previousTimestamp) {
-        deltaSeconds = (timestampMs - previousTimestamp) / 1000;
-      } else {
-        deltaSeconds = elapsedSeconds - previousElapsed;
-      }
-
-      // Treat long pauses / file gaps as stopped time. This prevents a 35 minute ride
-      // with a 5 hour recording gap from becoming a 6 hour ride for TSS and charts.
-      if (deltaSeconds > 0 && deltaSeconds <= gapThresholdSeconds) {
-        movingSeconds += deltaSeconds;
-      }
-    }
-
-    previousTimestamp = timestampMs || previousTimestamp;
-    previousElapsed = elapsedSeconds;
-
-    return {
-      ...point,
-      elapsedT: elapsedSeconds,
-      t: movingSeconds
-    };
-  });
-};
-
-const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => {
+const LongTermView = ({ riderId, riderName }) => {
   const [rides, setRides] = useState([]);
-  const [blocks, setBlocks] = useState([]);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [selectionStart, setSelectionStart] = useState(null);
   const [selectionEnd, setSelectionEnd] = useState(null);
   const [activeRange, setActiveRange] = useState(null);
-  const [selectedBlockId, setSelectedBlockId] = useState('');
-  const [compareBlockAId, setCompareBlockAId] = useState('');
-  const [compareBlockBId, setCompareBlockBId] = useState('');
-  const [longTermAnalysis, setLongTermAnalysis] = useState('');
-  const [isLongTermAnalyzing, setIsLongTermAnalyzing] = useState(false);
 
   useEffect(() => {
-    const loadRidesAndBlocks = async () => {
+    const loadRides = async () => {
       if (!supabase) {
         setErrorMessage('Supabase is not configured. Check VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.');
         return;
       }
       if (!riderId) {
         setRides([]);
-        setBlocks([]);
         return;
       }
 
       setLoading(true);
       setErrorMessage('');
 
-      const [{ data: rideData, error: rideError }, { data: blockData, error: blockError }] = await Promise.all([
-        supabase.from('rides').select('*').eq('rider_id', riderId).order('ride_date', { ascending: true }),
-        supabase.from('training_blocks').select('*').eq('rider_id', riderId).order('start_date', { ascending: true })
-      ]);
+      const { data, error } = await supabase
+        .from('rides')
+        .select('*')
+        .eq('rider_id', riderId)
+        .order('ride_date', { ascending: true });
 
-      if (rideError || blockError) {
-        const error = rideError || blockError;
-        console.error('Long-term load failed:', error);
+      if (error) {
+        console.error('Long-term ride load failed:', error);
         setErrorMessage(error.message);
       } else {
-        setRides(rideData || []);
-        setBlocks(blockData || []);
+        setRides(data || []);
       }
 
       setLoading(false);
     };
 
-    loadRidesAndBlocks();
+    loadRides();
   }, [riderId]);
 
   const chartData = useMemo(() => rides.map(ride => ({
@@ -241,13 +174,6 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
     duration: Number(ride.duration_hours) || 0
   })), [rides]);
 
-  const displayedChartData = useMemo(() => {
-    if (!activeRange) return chartData;
-    const start = activeRange.start <= activeRange.end ? activeRange.start : activeRange.end;
-    const end = activeRange.start <= activeRange.end ? activeRange.end : activeRange.start;
-    return chartData.filter(point => point.date >= start && point.date <= end);
-  }, [chartData, activeRange]);
-
   const selectedRides = useMemo(() => {
     if (!activeRange) return rides;
     const start = activeRange.start <= activeRange.end ? activeRange.start : activeRange.end;
@@ -255,21 +181,21 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
     return rides.filter(ride => ride.ride_date >= start && ride.ride_date <= end);
   }, [rides, activeRange]);
 
-  const summarizeRides = (rideList) => {
-    if (!rideList.length) {
+  const metrics = useMemo(() => {
+    if (!selectedRides.length) {
       return { rideCount: 0, totalTss: 0, totalHours: '0.0', avgPower: 0, avgNp: 0, avgVi: '0.00', avgHr: 0, avgDecoupling: '0.0' };
     }
 
-    const totalTss = rideList.reduce((sum, r) => sum + (Number(r.tss) || 0), 0);
-    const totalHours = rideList.reduce((sum, r) => sum + (Number(r.duration_hours) || 0), 0);
-    const powerRides = rideList.filter(r => Number(r.avg_power) > 0);
-    const npRides = rideList.filter(r => Number(r.normalized_power) > 0);
-    const viRides = rideList.filter(r => Number(r.variability_index) > 0);
-    const hrRides = rideList.filter(r => Number(r.avg_hr) > 0);
-    const validDecoupling = rideList.filter(r => Number(r.decoupling) > 0);
+    const totalTss = selectedRides.reduce((sum, r) => sum + (Number(r.tss) || 0), 0);
+    const totalHours = selectedRides.reduce((sum, r) => sum + (Number(r.duration_hours) || 0), 0);
+    const powerRides = selectedRides.filter(r => Number(r.avg_power) > 0);
+    const npRides = selectedRides.filter(r => Number(r.normalized_power) > 0);
+    const viRides = selectedRides.filter(r => Number(r.variability_index) > 0);
+    const hrRides = selectedRides.filter(r => Number(r.avg_hr) > 0);
+    const validDecoupling = selectedRides.filter(r => Number(r.decoupling) > 0);
 
     return {
-      rideCount: rideList.length,
+      rideCount: selectedRides.length,
       totalTss: Math.round(totalTss),
       totalHours: totalHours.toFixed(1),
       avgPower: powerRides.length ? Math.round(powerRides.reduce((sum, r) => sum + Number(r.avg_power), 0) / powerRides.length) : 0,
@@ -278,25 +204,7 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
       avgHr: hrRides.length ? Math.round(hrRides.reduce((sum, r) => sum + Number(r.avg_hr), 0) / hrRides.length) : 0,
       avgDecoupling: validDecoupling.length ? (validDecoupling.reduce((sum, r) => sum + Number(r.decoupling), 0) / validDecoupling.length).toFixed(1) : '0.0'
     };
-  };
-
-  const metrics = useMemo(() => summarizeRides(selectedRides), [selectedRides]);
-
-  const getBlockRides = (blockId) => {
-    const block = blocks.find(b => b.id === blockId);
-    if (!block) return [];
-    return rides.filter(ride => ride.ride_date >= block.start_date && ride.ride_date <= block.end_date);
-  };
-
-  const compareA = useMemo(() => {
-    const block = blocks.find(b => b.id === compareBlockAId);
-    return block ? { block, metrics: summarizeRides(getBlockRides(compareBlockAId)) } : null;
-  }, [compareBlockAId, blocks, rides]);
-
-  const compareB = useMemo(() => {
-    const block = blocks.find(b => b.id === compareBlockBId);
-    return block ? { block, metrics: summarizeRides(getBlockRides(compareBlockBId)) } : null;
-  }, [compareBlockBId, blocks, rides]);
+  }, [selectedRides]);
 
   const handleMouseDown = (event) => {
     if (!event?.activeLabel) return;
@@ -312,7 +220,6 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
   const handleMouseUp = () => {
     if (selectionStart && selectionEnd) {
       setActiveRange({ start: selectionStart, end: selectionEnd });
-      setSelectedBlockId('');
     }
     setSelectionStart(null);
     setSelectionEnd(null);
@@ -322,107 +229,6 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
     setActiveRange(null);
     setSelectionStart(null);
     setSelectionEnd(null);
-    setSelectedBlockId('');
-  };
-
-  const handleBlockSelect = (blockId) => {
-    setSelectedBlockId(blockId);
-    const block = blocks.find(b => b.id === blockId);
-    if (block) {
-      setActiveRange({ start: block.start_date, end: block.end_date });
-    } else {
-      setActiveRange(null);
-    }
-  };
-
-  const focusChartOnBlocks = (blockAId, blockBId) => {
-    const selectedBlocks = [blockAId, blockBId]
-      .map(id => blocks.find(block => block.id === id))
-      .filter(Boolean);
-
-    if (selectedBlocks.length === 0) return;
-
-    const starts = selectedBlocks.map(block => block.start_date).sort();
-    const ends = selectedBlocks.map(block => block.end_date).sort();
-    setSelectedBlockId('');
-    setActiveRange({ start: starts[0], end: ends[ends.length - 1] });
-  };
-
-  const handleCompareBlockASelect = (blockId) => {
-    setCompareBlockAId(blockId);
-    focusChartOnBlocks(blockId, compareBlockBId);
-  };
-
-  const handleCompareBlockBSelect = (blockId) => {
-    setCompareBlockBId(blockId);
-    focusChartOnBlocks(compareBlockAId, blockId);
-  };
-
-  const formatLongTermRidesForAi = (rideList) => {
-    if (!rideList.length) return 'No rides are visible in the current Long-Term View.';
-    return rideList.map(ride => `- ${ride.ride_date} | ${ride.name || 'Ride'} | Duration: ${ride.duration_hours || 'N/A'}h | TSS: ${ride.tss || 'N/A'} | Avg Power: ${ride.avg_power || 'N/A'}W | NP: ${ride.normalized_power || 'N/A'}W | VI: ${ride.variability_index || 'N/A'} | Avg HR: ${ride.avg_hr || 'N/A'} bpm | Decoupling: ${ride.decoupling || 'N/A'}%`).join('\n');
-  };
-
-  const formatVisibleBlocksForAi = () => {
-    if (!blocks.length || !displayedChartData.length) return 'No saved blocks are visible in the current view.';
-    const rangeStart = displayedChartData[0]?.date;
-    const rangeEnd = displayedChartData[displayedChartData.length - 1]?.date;
-    const visibleBlocks = blocks.filter(block => block.end_date >= rangeStart && block.start_date <= rangeEnd);
-    if (!visibleBlocks.length) return 'No saved blocks overlap this selected view.';
-    return visibleBlocks.map(block => `- ${block.block_name || 'Unnamed Block'} | Type: ${block.block_type || 'Unclassified'} | ${block.start_date} to ${block.end_date} | Objective: ${block.objective || 'N/A'}`).join('\n');
-  };
-
-  const handleAnalyzeVisibleLongTermView = async () => {
-    if (!aiRequest) {
-      alert('AI is not configured for the Long-Term View.');
-      return;
-    }
-    if (!selectedRides.length) {
-      alert('There are no visible rides to analyze. Select a rider, block, or date range first.');
-      return;
-    }
-
-    setIsLongTermAnalyzing(true);
-    setLongTermAnalysis('Analyzing the visible long-term rider data...');
-
-    const kbString = knowledgeBase.map(kb => `[ARTICLE: ${kb.title}]\n${kb.content}`).join('\n\n');
-    const prompt = `Analyze the visible Long-Term View data for ${riderName || 'this rider'}.
-
-Visible Date Range:
-${activeRange ? `${activeRange.start} to ${activeRange.end}` : 'All visible rides'}
-
-Summary Metrics:
-- Rides: ${metrics.rideCount}
-- Total TSS: ${metrics.totalTss}
-- Total Hours: ${metrics.totalHours}
-- Avg Power: ${metrics.avgPower}W
-- Avg NP: ${metrics.avgNp}W
-- Avg VI: ${metrics.avgVi}
-- Avg Decoupling: ${metrics.avgDecoupling}%
-
-Visible Saved Blocks:
-${formatVisibleBlocksForAi()}
-
-Visible Ride Data:
-${formatLongTermRidesForAi(selectedRides)}
-
-Analyze only the data above. Explain what type of rider this appears to be, the overall performance trends, what is improving, what is lagging, risks/red flags, and what the next training emphasis should be.`;
-
-    const systemInstruction = `You are Andrew Randell, an expert cycling coach. This Long-Term View AI coach must only analyze the rides and blocks explicitly shown in the prompt.
-
-SANS CHAINE KNOWLEDGE BASE:
-${kbString}
-
-CRITICAL DATA RULES:
-- Only use the visible Long-Term View data provided in the prompt.
-- Do not reference workouts, blocks, WHOOP data, or dates that are not included.
-- If the visible range is small, say the conclusions are directional.
-- Focus on rider phenotype, durability, aerobic control, repeatability, training response, and long-term performance trends.
-- Be practical, direct, and coaching-oriented.`;
-
-    const responseText = await aiRequest(prompt, systemInstruction);
-    setLongTermAnalysis(responseText);
-    setIsLongTermAnalyzing(false);
   };
 
   if (!riderId) {
@@ -441,54 +247,25 @@ CRITICAL DATA RULES:
           <div>
             <h2 className="text-3xl font-black text-slate-900 font-serif">Long-Term Rider View</h2>
             <p className="text-sm text-slate-500 mt-1">
-              {riderName ? `${riderName} · ` : ''}Drag across the chart, select a saved block, or compare two blocks.
+              {riderName ? `${riderName} · ` : ''}Drag across the chart to highlight a period. Metrics update to the selected range.
             </p>
             {activeRange && <p className="text-xs font-bold text-blue-600 mt-2 uppercase">Selected: {activeRange.start} to {activeRange.end}</p>}
           </div>
-          <div className="flex flex-wrap gap-2">
-            <button onClick={handleAnalyzeVisibleLongTermView} disabled={isLongTermAnalyzing || selectedRides.length === 0} className={`px-4 py-2 rounded-lg text-xs font-bold uppercase transition ${isLongTermAnalyzing || selectedRides.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-sm'}`}>
-              {isLongTermAnalyzing ? 'Analyzing...' : 'AI Analyze View'}
-            </button>
-            <button onClick={clearSelection} className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-bold uppercase text-slate-700">
-              Clear Selection
-            </button>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 no-print">
-          <div>
-            <label className="text-[10px] font-bold text-slate-400 uppercase">Select Saved Block</label>
-            <select className="w-full mt-1 p-2 border border-slate-200 rounded-lg text-sm bg-slate-50" value={selectedBlockId} onChange={(e) => handleBlockSelect(e.target.value)}>
-              <option value="">Manual range / all rides</option>
-              {blocks.map(block => <option key={block.id} value={block.id}>{block.start_date} to {block.end_date} · {block.block_type || 'Block'} · {block.block_name || 'Unnamed'}</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="text-[10px] font-bold text-slate-400 uppercase">Compare Block A</label>
-            <select className="w-full mt-1 p-2 border border-slate-200 rounded-lg text-sm bg-slate-50" value={compareBlockAId} onChange={(e) => handleCompareBlockASelect(e.target.value)}>
-              <option value="">Select block...</option>
-              {blocks.map(block => <option key={block.id} value={block.id}>{block.block_type || 'Block'} · {block.start_date}</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="text-[10px] font-bold text-slate-400 uppercase">Compare Block B</label>
-            <select className="w-full mt-1 p-2 border border-slate-200 rounded-lg text-sm bg-slate-50" value={compareBlockBId} onChange={(e) => handleCompareBlockBSelect(e.target.value)}>
-              <option value="">Select block...</option>
-              {blocks.map(block => <option key={block.id} value={block.id}>{block.block_type || 'Block'} · {block.start_date}</option>)}
-            </select>
-          </div>
+          <button onClick={clearSelection} className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-bold uppercase text-slate-700">
+            Clear Selection
+          </button>
         </div>
 
         {errorMessage && <div className="mb-4 rounded-lg bg-red-50 border border-red-100 p-3 text-sm text-red-700">{errorMessage}</div>}
         {loading ? (
-          <p className="text-sm text-slate-500">Loading rides and saved blocks...</p>
-        ) : displayedChartData.length === 0 ? (
+          <p className="text-sm text-slate-500">Loading rides...</p>
+        ) : chartData.length === 0 ? (
           <p className="text-sm text-slate-500">No rides found in Supabase for this rider yet.</p>
         ) : (
           <div className="h-[420px] select-none">
             <ResponsiveContainer width="100%" height="100%">
               <ComposedChart
-                data={displayedChartData}
+                data={chartData}
                 onMouseDown={handleMouseDown}
                 onMouseMove={handleMouseMove}
                 onMouseUp={handleMouseUp}
@@ -499,50 +276,15 @@ CRITICAL DATA RULES:
                 <YAxis yAxisId="left" tick={{ fontSize: 11 }} />
                 <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} />
                 <RechartsTooltip />
-                {blocks.map((block) => (
-                  <ReferenceArea key={block.id} yAxisId="left" x1={block.start_date} x2={block.end_date} strokeOpacity={0.15} fillOpacity={0.08} label={{ value: block.block_type || 'Block', position: 'insideTop', fontSize: 10 }} />
-                ))}
-                <Bar yAxisId="left" dataKey="tss" name="TSS" fill="#bfdbfe" radius={[4, 4, 0, 0]} />
-                <Line yAxisId="right" type="monotone" dataKey="decoupling" name="Decoupling %" stroke="#10b981" strokeWidth={2} dot={false} />
-                <Line yAxisId="right" type="monotone" dataKey="avgHr" name="Avg HR" stroke="#ef4444" strokeWidth={2} dot={false} />
-                <Line yAxisId="right" type="monotone" dataKey="normalizedPower" name="Normalized Power" stroke="#3b82f6" strokeWidth={2} dot={false} />
+                <Bar yAxisId="left" dataKey="tss" name="TSS" radius={[4, 4, 0, 0]} />
+                <Line yAxisId="right" type="monotone" dataKey="decoupling" name="Decoupling %" strokeWidth={2} dot={false} />
+                <Line yAxisId="right" type="monotone" dataKey="avgHr" name="Avg HR" strokeWidth={2} dot={false} />
+                <Line yAxisId="right" type="monotone" dataKey="normalizedPower" name="Normalized Power" strokeWidth={2} dot={false} />
                 {selectionStart && selectionEnd && (
                   <ReferenceArea yAxisId="left" x1={selectionStart} x2={selectionEnd} strokeOpacity={0.25} />
                 )}
               </ComposedChart>
             </ResponsiveContainer>
-          </div>
-        )}
-        {displayedChartData.length > 0 && blocks.length > 0 && (
-          <div className="mt-3 border-t border-slate-100 pt-3">
-            <div className="text-[10px] uppercase tracking-widest font-black text-slate-400 mb-2">Saved Training Blocks</div>
-            <div className="space-y-2">
-              {blocks
-                .filter(block => {
-                  const rangeStart = displayedChartData[0]?.date;
-                  const rangeEnd = displayedChartData[displayedChartData.length - 1]?.date;
-                  return !rangeStart || !rangeEnd || (block.end_date >= rangeStart && block.start_date <= rangeEnd);
-                })
-                .map(block => {
-                  const isA = block.id === compareBlockAId;
-                  const isB = block.id === compareBlockBId;
-                  const isSelected = block.id === selectedBlockId || isA || isB;
-                  return (
-                    <button
-                      key={block.id}
-                      onClick={() => handleBlockSelect(block.id)}
-                      className={`w-full text-left rounded-lg border px-3 py-2 transition ${isSelected ? 'bg-blue-50 border-blue-200' : 'bg-slate-50 border-slate-100 hover:bg-slate-100'}`}
-                    >
-                      <div className="h-2 rounded-full mb-2 bg-blue-300" />
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span className="text-xs font-black text-slate-800">{block.block_name || block.block_type || 'Saved Block'}</span>
-                        <span className="text-[10px] font-bold uppercase text-slate-400">{block.start_date} → {block.end_date}</span>
-                      </div>
-                      {(isA || isB) && <div className="text-[10px] font-black text-blue-600 mt-1">{isA ? 'Compare A' : 'Compare B'}</div>}
-                    </button>
-                  );
-                })}
-            </div>
           </div>
         )}
       </div>
@@ -556,43 +298,6 @@ CRITICAL DATA RULES:
         <MetricCard label="Avg VI" value={metrics.avgVi} />
         <MetricCard label="Avg Decoupling" value={`${metrics.avgDecoupling}%`} />
       </div>
-
-      {longTermAnalysis && (
-        <div className="bg-white rounded-2xl border border-blue-100 p-6 shadow-sm">
-          <div className="flex items-center gap-2 mb-3">
-            <Brain className="w-5 h-5 text-blue-600" />
-            <h3 className="text-xl font-black text-slate-900 font-serif">Long-Term AI Coach</h3>
-          </div>
-          <div className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap bg-blue-50/60 border border-blue-100 rounded-xl p-4">
-            {longTermAnalysis}
-          </div>
-        </div>
-      )}
-
-      {(compareA || compareB) && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
-          <h3 className="text-xl font-black text-slate-900 font-serif mb-4">Block Comparison</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {[compareA, compareB].map((item, idx) => item ? (
-              <div key={item.block.id} className="rounded-xl border border-slate-200 p-4 bg-slate-50">
-                <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">Block {idx === 0 ? 'A' : 'B'}</p>
-                <h4 className="font-black text-slate-800 mt-1">{item.block.block_name || item.block.block_type || 'Training Block'}</h4>
-                <p className="text-xs text-slate-500 mb-4">{item.block.start_date} to {item.block.end_date} · {item.block.block_type || 'Unclassified'}</p>
-                <div className="grid grid-cols-3 gap-3">
-                  <MetricCard label="Rides" value={item.metrics.rideCount} />
-                  <MetricCard label="TSS" value={item.metrics.totalTss} />
-                  <MetricCard label="Hours" value={item.metrics.totalHours} />
-                  <MetricCard label="Avg NP" value={`${item.metrics.avgNp}W`} />
-                  <MetricCard label="Avg VI" value={item.metrics.avgVi} />
-                  <MetricCard label="Decouple" value={`${item.metrics.avgDecoupling}%`} />
-                </div>
-              </div>
-            ) : (
-              <div key={idx} className="rounded-xl border border-dashed border-slate-200 p-4 bg-slate-50 text-sm text-slate-400">Select block {idx === 0 ? 'A' : 'B'} to compare.</div>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 };
@@ -674,15 +379,6 @@ const App = () => {
   const [durabilityMetrics, setDurabilityMetrics] = useState({ wkg: 4.1, decay: -3.2, status: 'Resilient' });
   const [isSavingToDatabase, setIsSavingToDatabase] = useState(false);
   const [databaseSaveStatus, setDatabaseSaveStatus] = useState('');
-  const [analysisBlockStart, setAnalysisBlockStart] = useState('');
-  const [analysisBlockEnd, setAnalysisBlockEnd] = useState('');
-  const [analysisBlockType, setAnalysisBlockType] = useState('');
-  const [analysisBlockName, setAnalysisBlockName] = useState('');
-  const [savedAnalysisBlocks, setSavedAnalysisBlocks] = useState([]);
-  const [selectedAnalysisBlockId, setSelectedAnalysisBlockId] = useState('');
-  const [isLoadingBlock, setIsLoadingBlock] = useState(false);
-  const [isSavingBlock, setIsSavingBlock] = useState(false);
-  const blockTypeOptions = ["VO2", "Tempo", "Recovery", "Zone 2", "Endurance", "Threshold", "Race Prep", "Custom"];
   const reasonOptions = ["Rest Day", "Sick", "No time", "Not motivated", "Travel", "Other"];
 
   // --- Persistence Hooks ---
@@ -814,12 +510,8 @@ const App = () => {
       duration: Number(ride.duration_hours) || 0,
       watts: Math.round(Number(ride.avg_power) || 0),
       hr: Math.round(Number(ride.avg_hr) || 0),
-      cadence: ride.avg_cadence ? Math.round(Number(ride.avg_cadence)) : (ride.cadence ? Math.round(Number(ride.cadence)) : null),
-      avgCadence: ride.avg_cadence ? Math.round(Number(ride.avg_cadence)) : (ride.cadence ? Math.round(Number(ride.cadence)) : null),
-      maxPower: ride.max_power ? Math.round(Number(ride.max_power)) : null,
-      maxHr: ride.max_hr ? Math.round(Number(ride.max_hr)) : null,
-      np: ride.normalized_power ? Math.round(Number(ride.normalized_power)) : (ride.avg_power ? Math.round(Number(ride.avg_power)) : null),
-      vi: ride.variability_index ? Number(Number(ride.variability_index).toFixed(2)) : (ride.normalized_power && ride.avg_power ? Number((Number(ride.normalized_power) / Number(ride.avg_power)).toFixed(2)) : null),
+      np: ride.normalized_power ? Math.round(Number(ride.normalized_power)) : null,
+      vi: ride.variability_index ? Number(Number(ride.variability_index).toFixed(2)) : null,
       wkg: ride.wkg ? Number(ride.wkg) : null,
       kj: ride.kj ? Math.round(Number(ride.kj)) : null,
       summary: ride.raw_summary || '',
@@ -837,60 +529,6 @@ const App = () => {
         target_power: Number(point.target) || null
       }))
     };
-  };
-
-  const loadSavedAnalysisBlocksForRider = async (riderId) => {
-    if (!supabase || !riderId) {
-      setSavedAnalysisBlocks([]);
-      return [];
-    }
-
-    try {
-      const { data, error } = await supabase
-        .from('training_blocks')
-        .select('*')
-        .eq('rider_id', riderId)
-        .order('start_date', { ascending: false });
-
-      if (error) throw error;
-      setSavedAnalysisBlocks(data || []);
-      return data || [];
-    } catch (error) {
-      console.error('Failed to load saved training blocks:', JSON.stringify(error, null, 2));
-      setSavedAnalysisBlocks([]);
-      return [];
-    }
-  };
-
-  const startNewAnalysisBlock = () => {
-    setSelectedAnalysisBlockId('');
-    setAnalysisBlockStart('');
-    setAnalysisBlockEnd('');
-    setAnalysisBlockType('');
-    setAnalysisBlockName('');
-    setClosingStatement('');
-    setPerformanceData([]);
-    setRawRides([]);
-    setCollapsedWeeks({});
-    setDayReasons({});
-    setImportStatus('idle');
-  };
-
-  const handleSavedAnalysisBlockSelect = (blockId) => {
-    if (!blockId) {
-      startNewAnalysisBlock();
-      return;
-    }
-
-    setSelectedAnalysisBlockId(blockId);
-    const block = savedAnalysisBlocks.find(b => b.id === blockId);
-    if (!block) return;
-
-    setAnalysisBlockStart(block.start_date || '');
-    setAnalysisBlockEnd(block.end_date || '');
-    setAnalysisBlockType(block.block_type || '');
-    setAnalysisBlockName(block.block_name || block.objective || '');
-    setClosingStatement(block.edited_report || block.coach_report || '');
   };
 
   const loadRiderDataFromSupabase = async (athlete) => {
@@ -920,8 +558,6 @@ const App = () => {
         return;
       }
 
-      await loadSavedAnalysisBlocksForRider(dbRider.id);
-
       const { data: dbRides, error: ridesError } = await supabase
         .from('rides')
         .select('*')
@@ -949,40 +585,15 @@ const App = () => {
         }, {});
       }
 
-      const { data: dbWhoopMetrics, error: whoopMetricsError } = await supabase
-        .from('whoop_metrics')
-        .select('*')
-        .eq('rider_id', dbRider.id);
-
-      if (whoopMetricsError) throw whoopMetricsError;
-
-      const loadedWhoopData = (dbWhoopMetrics || []).reduce((acc, row) => {
-        if (!row.metric_date) return acc;
-        acc[row.metric_date] = {
-          hrv: row.hrv !== null && row.hrv !== undefined ? Math.round(Number(row.hrv)) : null,
-          pulse: row.resting_hr !== null && row.resting_hr !== undefined ? Math.round(Number(row.resting_hr)) : null,
-          recovery: row.recovery !== null && row.recovery !== undefined ? Math.round(Number(row.recovery)) : null,
-          sleepHours: row.sleep_hours !== null && row.sleep_hours !== undefined ? Number(row.sleep_hours) : null,
-          timeInDeepSleep: row.time_in_deep_sleep !== null && row.time_in_deep_sleep !== undefined ? Number(row.time_in_deep_sleep) : null,
-          timeInLightSleep: row.time_in_light_sleep !== null && row.time_in_light_sleep !== undefined ? Number(row.time_in_light_sleep) : null,
-          timeInRemSleep: row.time_in_rem_sleep !== null && row.time_in_rem_sleep !== undefined ? Number(row.time_in_rem_sleep) : null,
-          timeAwake: row.time_awake !== null && row.time_awake !== undefined ? Number(row.time_awake) : null,
-          numberTimesWoken: row.number_times_woken !== null && row.number_times_woken !== undefined ? Number(row.number_times_woken) : null
-        };
-        return acc;
-      }, {});
-
       const loadedRides = (dbRides || []).map(ride => convertDbRideToAppRide(ride, samplesByRideId[ride.id] || []));
       const startDate = loadedRides[0]?.date || athlete.startingDate || '2026-03-16';
       const endDate = loadedRides[loadedRides.length - 1]?.date || athlete.endDate || startDate;
 
       setRawRides(loadedRides);
-      setWhoopData(loadedWhoopData);
+      setWhoopData({});
       setDayReasons({});
       setCollapsedWeeks({});
       setClosingStatement('');
-      setAnalysisBlockStart(startDate);
-      setAnalysisBlockEnd(endDate);
       setRiderData(prev => ({
         ...prev,
         ...athlete,
@@ -997,177 +608,13 @@ const App = () => {
         startingDate: startDate,
         endDate
       }));
-      setPerformanceData(generateWeeks(loadedRides, startDate, endDate, loadedWhoopData));
+      setPerformanceData(generateWeeks(loadedRides, startDate, endDate, {}));
       setImportStatus(loadedRides.length > 0 ? 'success' : 'idle');
     } catch (error) {
       console.error('Failed to load rider data from Supabase:', JSON.stringify(error, null, 2));
       resetSessionData();
       setImportStatus('error');
       alert(`Could not load rider data from Supabase: ${error.message}`);
-    }
-  };
-
-
-  const loadBlockAnalysisFromDatabase = async () => {
-    if (!supabase) {
-      alert('Supabase is not configured.');
-      return;
-    }
-
-    if (!riderData.supabaseId) {
-      alert('Select or save a rider before loading a block.');
-      return;
-    }
-
-    if (!analysisBlockStart || !analysisBlockEnd) {
-      alert('Select a block start and end date.');
-      return;
-    }
-
-    setIsLoadingBlock(true);
-    setImportStatus('syncing');
-
-    try {
-      const { data: dbRides, error: ridesError } = await supabase
-        .from('rides')
-        .select('*')
-        .eq('rider_id', riderData.supabaseId)
-        .gte('ride_date', analysisBlockStart)
-        .lte('ride_date', analysisBlockEnd)
-        .order('ride_date', { ascending: true });
-
-      if (ridesError) throw ridesError;
-
-      const rideIds = (dbRides || []).map(ride => ride.id);
-      let samplesByRideId = {};
-
-      if (rideIds.length > 0) {
-        const { data: dbSamples, error: samplesError } = await supabase
-          .from('ride_samples')
-          .select('*')
-          .in('ride_id', rideIds)
-          .order('sample_index', { ascending: true });
-
-        if (samplesError) throw samplesError;
-
-        samplesByRideId = (dbSamples || []).reduce((acc, sample) => {
-          if (!acc[sample.ride_id]) acc[sample.ride_id] = [];
-          acc[sample.ride_id].push(sample);
-          return acc;
-        }, {});
-      }
-
-      const { data: dbWhoopMetrics, error: whoopMetricsError } = await supabase
-        .from('whoop_metrics')
-        .select('*')
-        .eq('rider_id', riderData.supabaseId)
-        .gte('metric_date', analysisBlockStart)
-        .lte('metric_date', analysisBlockEnd);
-
-      if (whoopMetricsError) throw whoopMetricsError;
-
-      const loadedWhoopData = (dbWhoopMetrics || []).reduce((acc, row) => {
-        if (!row.metric_date) return acc;
-        acc[row.metric_date] = {
-          hrv: row.hrv !== null && row.hrv !== undefined ? Math.round(Number(row.hrv)) : null,
-          pulse: row.resting_hr !== null && row.resting_hr !== undefined ? Math.round(Number(row.resting_hr)) : null,
-          recovery: row.recovery !== null && row.recovery !== undefined ? Math.round(Number(row.recovery)) : null,
-          sleepHours: row.sleep_hours !== null && row.sleep_hours !== undefined ? Number(row.sleep_hours) : null,
-          timeInDeepSleep: row.time_in_deep_sleep !== null && row.time_in_deep_sleep !== undefined ? Number(row.time_in_deep_sleep) : null,
-          timeInLightSleep: row.time_in_light_sleep !== null && row.time_in_light_sleep !== undefined ? Number(row.time_in_light_sleep) : null,
-          timeInRemSleep: row.time_in_rem_sleep !== null && row.time_in_rem_sleep !== undefined ? Number(row.time_in_rem_sleep) : null,
-          timeAwake: row.time_awake !== null && row.time_awake !== undefined ? Number(row.time_awake) : null,
-          numberTimesWoken: row.number_times_woken !== null && row.number_times_woken !== undefined ? Number(row.number_times_woken) : null
-        };
-        return acc;
-      }, {});
-
-      const loadedRides = (dbRides || []).map(ride => convertDbRideToAppRide(ride, samplesByRideId[ride.id] || []));
-
-      setRawRides(loadedRides);
-      setWhoopData(loadedWhoopData);
-      setDayReasons({});
-      setCollapsedWeeks({});
-      if (!selectedAnalysisBlockId) setClosingStatement('');
-      setRiderData(prev => ({
-        ...prev,
-        startingDate: analysisBlockStart,
-        endDate: analysisBlockEnd,
-        objective: analysisBlockName || prev.objective
-      }));
-      setPerformanceData(generateWeeks(loadedRides, analysisBlockStart, analysisBlockEnd, loadedWhoopData));
-      setImportStatus(loadedRides.length > 0 ? 'success' : 'idle');
-    } catch (error) {
-      console.error('Block load failed:', JSON.stringify(error, null, 2));
-      setImportStatus('error');
-      alert(`Block load failed: ${error.message}`);
-    } finally {
-      setIsLoadingBlock(false);
-    }
-  };
-
-  const saveTrainingBlockAnalysis = async () => {
-    if (!supabase) {
-      alert('Supabase is not configured.');
-      return;
-    }
-
-    if (!riderData.supabaseId) {
-      alert('Select or save a rider before saving the block.');
-      return;
-    }
-
-    if (!analysisBlockStart || !analysisBlockEnd || !analysisBlockType) {
-      alert('Add a block start date, end date, and block type before saving.');
-      return;
-    }
-
-    setIsSavingBlock(true);
-
-    try {
-      const payload = {
-        rider_id: riderData.supabaseId,
-        block_name: analysisBlockName || `${analysisBlockType} Block`,
-        block_type: analysisBlockType,
-        start_date: analysisBlockStart,
-        end_date: analysisBlockEnd,
-        objective: riderData.objective || null,
-        coach_report: closingStatement || null,
-        edited_report: closingStatement || null,
-        updated_at: new Date().toISOString()
-      };
-
-      let savedBlock;
-      if (selectedAnalysisBlockId) {
-        const { data, error } = await supabase
-          .from('training_blocks')
-          .update(payload)
-          .eq('id', selectedAnalysisBlockId)
-          .select()
-          .single();
-
-        if (error) throw error;
-        savedBlock = data;
-      } else {
-        const { data, error } = await supabase
-          .from('training_blocks')
-          .insert(payload)
-          .select()
-          .single();
-
-        if (error) throw error;
-        savedBlock = data;
-      }
-
-      if (savedBlock?.id) setSelectedAnalysisBlockId(savedBlock.id);
-      await loadSavedAnalysisBlocksForRider(riderData.supabaseId);
-
-      alert(selectedAnalysisBlockId ? 'Training block updated.' : 'New training block saved.');
-    } catch (error) {
-      console.error('Training block save failed:', JSON.stringify(error, null, 2));
-      alert(`Training block save failed: ${error.message}`);
-    } finally {
-      setIsSavingBlock(false);
     }
   };
 
@@ -1198,8 +645,6 @@ const App = () => {
       }
     });
     setSelectedRosterId('');
-    setSelectedAnalysisBlockId('');
-    setSavedAnalysisBlocks([]);
     resetSessionData();
   };
 
@@ -1280,7 +725,6 @@ const App = () => {
 
       setSelectedRosterId(savedRider.id);
       await loadRidersFromDatabase();
-      await loadSavedAnalysisBlocksForRider(savedRider.id);
 
       setSaveStatus('Saved to Database!');
       setTimeout(() => setSaveStatus(''), 2000);
@@ -1392,10 +836,7 @@ const App = () => {
           normalized_power: safeNp,
           variability_index: safeVi,
           decoupling: Number(ride.decoupling) || null,
-          cadence: Number(ride.cadence || ride.avgCadence) || null,
-          avg_cadence: Number(ride.avgCadence || ride.cadence) || null,
-          max_power: Number(ride.maxPower) || null,
-          max_hr: Number(ride.maxHr) || null,
+          cadence: Number(ride.cadence) || null,
           kj: Number(ride.kj) || null,
           wkg: Number(ride.wkg) || null,
           sync_method: ride.syncMethod || null,
@@ -1409,10 +850,7 @@ const App = () => {
         name: r.name,
         avg_power: r.avg_power,
         normalized_power: r.normalized_power,
-        variability_index: r.variability_index,
-        avg_cadence: r.avg_cadence,
-        max_power: r.max_power,
-        max_hr: r.max_hr
+        variability_index: r.variability_index
       })));
 
       const { data: savedRides, error: ridesError } = await supabase
@@ -1431,20 +869,7 @@ const App = () => {
         // Primary match by dedupe key; fallback by index so samples are never skipped after an upsert.
         const savedRide = savedRideByKey.get(dedupeKey) || savedRides?.[rideIndex];
 
-        const pointsSource =
-          originalRide?.chartData?.length > 0
-            ? originalRide.chartData
-            : originalRide?.sampleData?.length > 0
-              ? originalRide.sampleData.map(point => ({
-                  time: point.time_minutes,
-                  watts: point.watts,
-                  hr: point.heart_rate,
-                  cadence: point.cadence,
-                  target: point.target_power
-                }))
-              : [];
-
-        const pointsToSave = pointsSource.map((point, pointIndex) => ({
+        const pointsToSave = (originalRide?.chartData || []).map((point, pointIndex) => ({
           sample_index: pointIndex,
           time_minutes: Number(point.time) || 0,
           watts: Number(point.watts) || null,
@@ -1458,8 +883,7 @@ const App = () => {
             rideName: originalRide?.name,
             dedupeKey,
             hasSavedRide: Boolean(savedRide),
-            chartPoints: originalRide?.chartData?.length || 0,
-            samplePoints: originalRide?.sampleData?.length || 0
+            chartPoints: originalRide?.chartData?.length || 0
           });
           return;
         }
@@ -1499,36 +923,12 @@ const App = () => {
         }
       }
 
-      const whoopRows = Object.entries(whoopData || {})
-        .map(([metricDate, metrics]) => ({
-          rider_id: riderId,
-          metric_date: metricDate,
-          hrv: metrics?.hrv ?? null,
-          resting_hr: metrics?.pulse ?? metrics?.restingHr ?? null,
-          recovery: metrics?.recovery ?? null,
-          sleep_hours: metrics?.sleepHours ?? null,
-          time_in_deep_sleep: metrics?.timeInDeepSleep ?? null,
-          time_in_light_sleep: metrics?.timeInLightSleep ?? null,
-          time_in_rem_sleep: metrics?.timeInRemSleep ?? null,
-          time_awake: metrics?.timeAwake ?? null,
-          number_times_woken: metrics?.numberTimesWoken ?? null
-        }))
-        .filter(row => row.metric_date && Object.entries(row).some(([key, value]) => !['rider_id', 'metric_date'].includes(key) && value !== null && value !== undefined && value !== ''));
-
-      if (whoopRows.length > 0) {
-        const { error: whoopError } = await supabase
-          .from('whoop_metrics')
-          .upsert(whoopRows, { onConflict: 'rider_id,metric_date' });
-
-        if (whoopError) throw whoopError;
-      }
-
-      setDatabaseSaveStatus(`Saved or updated ${rideRows.length} rides, ${sampleRows.length} chart sample points, and ${whoopRows.length} WHOOP metric days to database.`);
+      setDatabaseSaveStatus(`Saved or updated ${rideRows.length} rides and ${sampleRows.length} chart sample points to database.`);
 
       // Reload from Supabase immediately so Block Analysis uses database-backed rides and charts.
       await loadRiderDataFromSupabase({ ...riderData, name: riderData.name });
 
-      alert(`Saved or updated ${rideRows.length} rides, ${sampleRows.length} chart sample points, and ${whoopRows.length} WHOOP metric days to Supabase.`);
+      alert(`Saved or updated ${rideRows.length} rides and ${sampleRows.length} chart sample points to Supabase.`);
     } catch (error) {
       console.error('Database save failed:', JSON.stringify(error, null, 2));
       setDatabaseSaveStatus(`Database save failed: ${error.message}`);
@@ -1574,8 +974,10 @@ const App = () => {
 
  // --- OpenAI API ---
   const fetchOpenAIResponse = async (prompt, systemInstruction) => {
+    const apiKey = import.meta.env.VITE_OPENAI_API_KEY; 
+    const url = `https://api.openai.com/v1/chat/completions`;
     const payload = {
-      model: "gpt-4o-mini",
+      model: "gpt-4o-mini", // You can change this to "gpt-3.5-turbo" if you want it to be cheaper/faster
       messages: [
         { role: "system", content: systemInstruction },
         { role: "user", content: prompt }
@@ -1583,49 +985,32 @@ const App = () => {
       temperature: 0.7
     };
 
-    const callServerRoute = async () => {
-      const response = await fetch('/api/openai', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Server API HTTP ${response.status}: ${errorText}`);
-      }
-      const result = await response.json();
-      return result.choices?.[0]?.message?.content || result.content || "Sorry, I couldn't generate a response.";
-    };
-
-    const callBrowserFallback = async () => {
-      const apiKey = import.meta.env.VITE_OPENAI_API_KEY;
-      if (!apiKey) throw new Error('No client-side VITE_OPENAI_API_KEY found. Add OPENAI_API_KEY to Vercel for /api/openai, or VITE_OPENAI_API_KEY for local fallback.');
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`OpenAI HTTP ${response.status}: ${errorText}`);
-      }
-      const result = await response.json();
-      return result.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
-    };
-
-    try {
-      return await callServerRoute();
-    } catch (serverErr) {
-      console.warn('Server AI route failed, trying browser fallback:', serverErr);
+    const delays = [1000, 2000, 4000, 8000, 16000];
+    for (let i = 0; i < 6; i++) {
       try {
-        return await callBrowserFallback();
-      } catch (clientErr) {
-        console.error('OpenAI request failed:', clientErr);
-        return `Error: Unable to connect to the analysis engine. Details: ${clientErr.message}`;
-      }
+        const response = await fetch(url, { 
+          method: 'POST', 
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}` 
+          }, 
+          body: JSON.stringify(payload) 
+        });
+        if (!response.ok) {
+  const errorText = await response.text();
+  throw new Error(`HTTP ${response.status}: ${errorText}`);
+}
+        const result = await response.json();
+        return result.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
+      } catch (err) {
+  console.error("OpenAI request failed:", err);
+
+  if (i === 5) {
+    return `Error: Unable to connect to the analysis engine. Details: ${err.message}`;
+  }
+
+  await new Promise(resolve => setTimeout(resolve, delays[i]));
+}
     }
   };
 
@@ -1685,12 +1070,7 @@ const App = () => {
         week.days.forEach(day => {
           const currentDayTime = new Date(day.date + 'T00:00:00').getTime();
           if (currentDayTime > todayTime) return; 
-          const whoopFields = [];
-          if (day.whoop?.recovery) whoopFields.push(`WHOOP Recovery: ${day.whoop.recovery}%`);
-          if (day.whoop?.hrv) whoopFields.push(`HRV: ${day.whoop.hrv}`);
-          if (day.whoop?.pulse) whoopFields.push(`Resting HR: ${day.whoop.pulse}bpm`);
-          if (day.whoop?.sleepHours) whoopFields.push(`Sleep: ${day.whoop.sleepHours}h`);
-          const recoveryStr = whoopFields.length ? ` | ${whoopFields.join(' | ')}` : '';
+          const recoveryStr = day.whoop?.recovery ? ` | WHOOP Recovery: ${day.whoop.recovery}%` : '';
           
           if (day.rides.length > 0) {
             day.rides.forEach(r => {
@@ -2084,14 +1464,9 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
               }
 
               if (elapsed_sec > allSessions[baseFileName].maxElapsed) allSessions[baseFileName].maxElapsed = elapsed_sec;
-              if (pwr > 0 || hr > 0) allSessions[baseFileName].dataPoints.push({ p: pwr, hr: hr, cad: cad, t: elapsed_sec, timestampMs: timestampDate.getTime() });
+              if (pwr > 0 || hr > 0) allSessions[baseFileName].dataPoints.push({ p: pwr, hr: hr, cad: cad, t: elapsed_sec });
           }
       }
-
-      Object.values(allSessions).forEach(session => {
-          session.dataPoints = compressRideTimeline(session.dataPoints, 15);
-          session.maxElapsed = session.dataPoints.length > 0 ? Math.max(...session.dataPoints.map(d => Number(d.t) || 0)) : 0;
-      });
 
       const weightToUse = parseFloat(riderData.weight) || 70;
 
@@ -2113,8 +1488,6 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
           const durationHours = s.maxElapsed / 3600; const count = s.dataPoints.length;
           const avgWatts = count > 0 ? Math.round(s.dataPoints.reduce((acc, curr) => acc + curr.p, 0) / count) : 0;
           const avgHr = count > 0 ? Math.round(s.dataPoints.reduce((acc, curr) => acc + curr.hr, 0) / count) : 0;
-          const maxPower = count > 0 ? Math.max(...s.dataPoints.map(d => Number(d.p) || 0)) : 0;
-          const maxHr = count > 0 ? Math.max(...s.dataPoints.map(d => Number(d.hr) || 0)) : 0;
           const cadPoints = s.dataPoints.filter(d => Number(d.cad) > 0);
           const avgCadence = cadPoints.length > 0 ? Math.round(cadPoints.reduce((acc, curr) => acc + Number(curr.cad || 0), 0) / cadPoints.length) : null;
           
@@ -2135,9 +1508,6 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
               watts: avgWatts,
               hr: avgHr,
               cadence: avgCadence,
-              avgCadence: avgCadence,
-              maxPower: maxPower || null,
-              maxHr: maxHr || null,
               wkg: parseFloat((avgWatts / weightToUse).toFixed(2)),
               kj: Math.round(s.dataPoints.reduce((acc, curr) => acc + curr.p, 0) / 1000), 
               summary: "Technical data synced. Pending context matching...",
@@ -2230,98 +1600,32 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
       const lines = csvText.replace(/^\uFEFF/, '').split(/\r?\n/);
       const parsedWhoop = { ...whoopData };
       const headers = parseCSVRow(lines[0]).map(h => h.replace(/["']/g, '').trim().toLowerCase());
-      const isWideMetricsFormat = headers.includes('hrv') || headers.includes('restinghr') || headers.includes('resting hr') || headers.includes('pulse');
-
-      const normalizeMetricDate = (rawDate) => {
-        if (!rawDate) return '';
-        let cleanDate = String(rawDate).replace(/["']/g, '').trim().split(' ')[0];
-        if (cleanDate.includes('/')) {
-          const d = new Date(cleanDate);
-          if (!isNaN(d)) cleanDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-        }
-        return cleanDate;
-      };
-
-      const ensureDay = (date) => {
-        if (!parsedWhoop[date]) {
-          parsedWhoop[date] = {
-            hrv: null,
-            pulse: null,
-            recovery: null,
-            sleepHours: null,
-            timeInDeepSleep: null,
-            timeInLightSleep: null,
-            timeInRemSleep: null,
-            timeAwake: null,
-            numberTimesWoken: null
-          };
-        }
-        return parsedWhoop[date];
-      };
-
-      const assignMetric = (day, rawType, rawValue) => {
-        const type = String(rawType || '').toLowerCase().trim();
-        const value = String(rawValue || '').replace(/["']/g, '').trim();
-        const numeric = parseFloat(value);
-
-        if (!type) return;
-
-        if (type === 'hrv' && !Number.isNaN(numeric)) day.hrv = Math.round(numeric);
-        else if ((type === 'pulse' || type === 'restinghr' || type === 'resting hr' || type === 'resting heart rate') && !Number.isNaN(numeric)) day.pulse = Math.round(numeric);
-        else if ((type === 'recovery' || type === 'recovery score') && !Number.isNaN(numeric)) day.recovery = Math.round(numeric);
-        else if (type === 'notes' && value.includes('WHOOP Recovery Score:')) {
-          const match = value.match(/WHOOP Recovery Score:\s*(\d+)/);
-          if (match && match[1]) day.recovery = parseInt(match[1], 10);
-        }
-        else if ((type === 'sleep hours' || type === 'asleep duration' || type === 'hours asleep') && !Number.isNaN(numeric)) day.sleepHours = Number(numeric.toFixed(2));
-        else if ((type === 'time in deep sleep' || type === 'deep sleep') && !Number.isNaN(numeric)) day.timeInDeepSleep = Number(numeric.toFixed(2));
-        else if ((type === 'time in light sleep' || type === 'light sleep') && !Number.isNaN(numeric)) day.timeInLightSleep = Number(numeric.toFixed(2));
-        else if ((type === 'time in rem sleep' || type === 'rem sleep') && !Number.isNaN(numeric)) day.timeInRemSleep = Number(numeric.toFixed(2));
-        else if ((type === 'time awake' || type === 'awake time') && !Number.isNaN(numeric)) day.timeAwake = Number(numeric.toFixed(2));
-        else if ((type === 'number times woken' || type === 'times woken' || type === 'wake events') && !Number.isNaN(numeric)) day.numberTimesWoken = Math.round(numeric);
-      };
+      const isTPMetricsFormat = headers.includes('hrv') || headers.includes('restinghr') || headers.includes('pulse');
 
       for (let i = 1; i < lines.length; i++) {
         if (!lines[i].trim()) continue;
         const parts = parseCSVRow(lines[i]);
-
-        if (isWideMetricsFormat) {
-            const obj = {};
-            headers.forEach((h, idx) => { obj[h] = parts[idx] ? parts[idx].replace(/["']/g, '').trim() : ''; });
-
-            const metricDate = normalizeMetricDate(obj['date'] || obj['day'] || obj['timestamp']);
-            if (!metricDate) continue;
-
-            const day = ensureDay(metricDate);
-            if (obj['hrv']) assignMetric(day, 'hrv', obj['hrv']);
-            if (obj['restinghr']) assignMetric(day, 'restinghr', obj['restinghr']);
-            if (obj['resting hr']) assignMetric(day, 'resting hr', obj['resting hr']);
-            if (obj['pulse']) assignMetric(day, 'pulse', obj['pulse']);
-            if (obj['recovery']) assignMetric(day, 'recovery', obj['recovery']);
-            if (obj['sleep hours']) assignMetric(day, 'sleep hours', obj['sleep hours']);
-            if (obj['time in deep sleep']) assignMetric(day, 'time in deep sleep', obj['time in deep sleep']);
-            if (obj['time in light sleep']) assignMetric(day, 'time in light sleep', obj['time in light sleep']);
-            if (obj['time in rem sleep']) assignMetric(day, 'time in rem sleep', obj['time in rem sleep']);
-            if (obj['time awake']) assignMetric(day, 'time awake', obj['time awake']);
-            if (obj['number times woken']) assignMetric(day, 'number times woken', obj['number times woken']);
-            if (obj['notes']) assignMetric(day, 'notes', obj['notes']);
+        if (isTPMetricsFormat) {
+            const obj = {}; headers.forEach((h, idx) => { obj[h] = parts[idx] ? parts[idx].replace(/["']/g, '').trim() : ''; });
+            let tpDate = obj['date'] || obj['day'] || '';
+            if (tpDate.includes('/')) { const d = new Date(tpDate); if (!isNaN(d)) tpDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
+            if (!tpDate) continue;
+            if (!parsedWhoop[tpDate]) parsedWhoop[tpDate] = { hrv: null, pulse: null, recovery: null };
+            if (obj['hrv']) parsedWhoop[tpDate].hrv = Math.round(parseFloat(obj['hrv']));
+            if (obj['restinghr'] || obj['pulse']) parsedWhoop[tpDate].pulse = Math.round(parseFloat(obj['restinghr'] || obj['pulse']));
+            if (obj['recovery']) parsedWhoop[tpDate].recovery = parseInt(obj['recovery'], 10);
+            if (obj['notes'] && obj['notes'].includes('WHOOP Recovery Score:')) { const match = obj['notes'].match(/WHOOP Recovery Score:\s*(\d+)/); if (match && match[1]) parsedWhoop[tpDate].recovery = parseInt(match[1], 10); }
         } else {
-            // Long TrainingPeaks Metrics export format:
-            // Timestamp, Type, Value
             if (parts.length < 3) continue;
-            const metricDate = normalizeMetricDate(parts[0]);
-            const type = parts[1];
-            const value = parts[2];
-            if (!metricDate) continue;
-
-            const day = ensureDay(metricDate);
-            assignMetric(day, type, value);
+            const date = parts[0].split(' ')[0]; const type = parts[1]; const value = parts[2];
+            if (!date) continue;
+            if (!parsedWhoop[date]) parsedWhoop[date] = { hrv: null, pulse: null, recovery: null };
+            if (type === 'HRV') parsedWhoop[date].hrv = Math.round(parseFloat(value));
+            else if (type === 'Pulse') parsedWhoop[date].pulse = Math.round(parseFloat(value));
+            else if (type === 'Notes' && value.includes('WHOOP Recovery Score:')) { const match = value.match(/WHOOP Recovery Score:\s*(\d+)/); if (match && match[1]) parsedWhoop[date].recovery = parseInt(match[1], 10); }
         }
       }
-
-      setWhoopData(parsedWhoop);
-      setPerformanceData(generateWeeks(rawRides, riderData.startingDate, riderData.endDate, parsedWhoop));
-      setWhoopStatus('success');
+      setWhoopData(parsedWhoop); setPerformanceData(generateWeeks(rawRides, riderData.startingDate, riderData.endDate, parsedWhoop)); setWhoopStatus('success');
   };
 
   const handleWhoopImport = async (e) => {
@@ -2430,7 +1734,7 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
             </button>
             <button onClick={() => setView('onboarding')} className={`px-4 py-2 text-xs font-bold uppercase rounded-md transition ${view === 'onboarding' ? 'bg-blue-600' : 'hover:bg-slate-800'}`}>Intake Sync</button>
             <button onClick={() => setView('longterm')} className={`px-4 py-2 text-xs font-bold uppercase rounded-md transition ${view === 'longterm' ? 'bg-emerald-600' : 'hover:bg-slate-800'}`}>Long-Term View</button>
-            <button onClick={() => setView('report')} className={`px-4 py-2 text-xs font-bold uppercase rounded-md transition ${view === 'report' ? 'bg-blue-600' : 'hover:bg-slate-800'}`}>Block Analysis</button>
+            <button onClick={() => setView('report')} className={`px-4 py-2 text-xs font-bold uppercase rounded-md transition ${view === 'report' ? 'bg-blue-600' : 'hover:bg-slate-800'}`} disabled={performanceData.length === 0}>Report</button>
           </div>
         </div>
       </header>
@@ -2438,7 +1742,7 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
       <main className="max-w-7xl mx-auto px-6 pt-8 relative">
         
         {view === 'longterm' && (
-          <LongTermView riderId={riderData.supabaseId} riderName={riderData.name} aiRequest={fetchOpenAIResponse} knowledgeBase={knowledgeBase} />
+          <LongTermView riderId={riderData.supabaseId} riderName={riderData.name} />
         )}
 
         {/* === RIDER PROFILE & CONFIGURATION VIEW === */}
@@ -2783,7 +2087,7 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                   </select>
                 </div>
 
-                <div className="grid grid-cols-2 gap-4 mb-2 mt-2">
+                <div className="grid grid-cols-2 gap-4 mb-4 mt-2">
                   <div>
                     <label className="text-[10px] font-bold text-slate-400 uppercase">Starting CTL</label>
                     <input type="number" className="w-full mt-1 p-2 border border-slate-200 rounded text-sm outline-none focus:ring-1 focus:ring-blue-500 bg-slate-50" value={riderData.startingCTL} onChange={(e) => setRiderData({...riderData, startingCTL: e.target.value})} />
@@ -2793,7 +2097,22 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                     <input type="number" className="w-full mt-1 p-2 border border-slate-200 rounded text-sm outline-none focus:ring-1 focus:ring-blue-500 bg-slate-50" value={riderData.startingATL} onChange={(e) => setRiderData({...riderData, startingATL: e.target.value})} />
                   </div>
                 </div>
-                <p className="text-[10px] text-slate-400 uppercase font-bold tracking-wider">Block dates and block type are now defined on the Report / Block Analysis page.</p>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase flex items-center gap-1"><CalendarIcon className="w-3 h-3"/> Block Start Date</label>
+                    <input type="date" className="w-full mt-1 p-2 border border-slate-200 rounded text-sm outline-none focus:ring-1 focus:ring-blue-500 bg-slate-50" value={riderData.startingDate} onChange={(e) => {
+                      setRiderData({...riderData, startingDate: e.target.value});
+                      if (rawRides.length > 0) setPerformanceData(generateWeeks(rawRides, e.target.value, riderData.endDate, whoopData));
+                    }} />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase flex items-center gap-1"><CalendarIcon className="w-3 h-3"/> Block End (Auto)</label>
+                    <input type="date" className="w-full mt-1 p-2 border border-slate-200 rounded text-sm outline-none focus:ring-1 focus:ring-blue-500 bg-slate-50" value={riderData.endDate} onChange={(e) => {
+                      setRiderData({...riderData, endDate: e.target.value});
+                      if (rawRides.length > 0) setPerformanceData(generateWeeks(rawRides, riderData.startingDate, e.target.value, whoopData));
+                    }} />
+                  </div>
+                </div>
               </div>
 
               <h2 className="text-3xl font-bold text-slate-900 mt-8 mb-2 font-serif italic">Sync Workflow</h2>
@@ -2886,65 +2205,11 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
         )}
 
         {/* === REPORT VIEW === */}
-        {view === 'report' && (
-          <div className="animate-in slide-in-from-bottom-4 duration-700 space-y-8">
-            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm no-print">
-              <div className="flex items-start justify-between gap-4 mb-5">
-                <div>
-                  <h2 className="text-2xl font-black text-slate-900 font-serif">Block Analysis Setup</h2>
-                  <p className="text-sm text-slate-500 mt-1">Choose the block dates and define the training focus before generating the coach report.</p>
-                </div>
-                <div className="text-right">
-                  <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">Selected Rider</p>
-                  <p className="text-sm font-bold text-slate-800">{riderData.name || 'No rider selected'}</p>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-6 gap-4 items-end">
-                <div>
-                  <label className="text-[10px] font-bold text-slate-400 uppercase">Saved Blocks</label>
-                  <select className="w-full mt-1 p-2 border border-slate-200 rounded text-sm outline-none focus:ring-1 focus:ring-blue-500 bg-slate-50" value={selectedAnalysisBlockId} onChange={(e) => handleSavedAnalysisBlockSelect(e.target.value)}>
-                    <option value="">New / Manual Block</option>
-                    {savedAnalysisBlocks.map(block => <option key={block.id} value={block.id}>{block.start_date} to {block.end_date} · {block.block_type || 'Block'} · {block.block_name || 'Unnamed'}</option>)}
-                  </select>
-                  <button type="button" onClick={startNewAnalysisBlock} className="mt-2 text-[10px] font-black uppercase text-blue-600 hover:text-blue-800">+ Start New Block</button>
-                </div>
-                <div>
-                  <label className="text-[10px] font-bold text-slate-400 uppercase flex items-center gap-1"><CalendarIcon className="w-3 h-3"/> Block Start</label>
-                  <input type="date" className="w-full mt-1 p-2 border border-slate-200 rounded text-sm outline-none focus:ring-1 focus:ring-blue-500 bg-slate-50" value={analysisBlockStart} onChange={(e) => setAnalysisBlockStart(e.target.value)} />
-                </div>
-                <div>
-                  <label className="text-[10px] font-bold text-slate-400 uppercase flex items-center gap-1"><CalendarIcon className="w-3 h-3"/> Block End</label>
-                  <input type="date" className="w-full mt-1 p-2 border border-slate-200 rounded text-sm outline-none focus:ring-1 focus:ring-blue-500 bg-slate-50" value={analysisBlockEnd} onChange={(e) => setAnalysisBlockEnd(e.target.value)} />
-                </div>
-                <div>
-                  <label className="text-[10px] font-bold text-slate-400 uppercase">Block Type</label>
-                  <select className="w-full mt-1 p-2 border border-slate-200 rounded text-sm outline-none focus:ring-1 focus:ring-blue-500 bg-slate-50" value={analysisBlockType} onChange={(e) => setAnalysisBlockType(e.target.value)}>
-                    <option value="">Select block type...</option>
-                    {blockTypeOptions.map(type => <option key={type} value={type}>{type}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-[10px] font-bold text-slate-400 uppercase">Block Name / Objective</label>
-                  <input type="text" className="w-full mt-1 p-2 border border-slate-200 rounded text-sm outline-none focus:ring-1 focus:ring-blue-500 bg-slate-50" value={analysisBlockName} onChange={(e) => setAnalysisBlockName(e.target.value)} placeholder="e.g. June Tempo Block" />
-                </div>
-                <button onClick={loadBlockAnalysisFromDatabase} disabled={isLoadingBlock || !riderData.supabaseId} className={`px-4 py-2 rounded-lg text-xs font-bold uppercase transition ${isLoadingBlock || !riderData.supabaseId ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-slate-900 text-white hover:bg-slate-800'}`}>
-                  {isLoadingBlock ? 'Loading Block...' : 'Load Block'}
-                </button>
-              </div>
-
-              {performanceData.length === 0 && (
-                <div className="mt-5 rounded-xl bg-blue-50 border border-blue-100 p-4 text-sm text-blue-900">
-                  Select a rider, choose a date range, then load the block from the database. The report will populate using saved rides and chart samples.
-                </div>
-              )}
-            </div>
-
-            {performanceData.length > 0 && aggregateStats && (
-              <div id="report-content" className="space-y-8">
+        {view === 'report' && performanceData.length > 0 && aggregateStats && (
+          <div id="report-content" className="animate-in slide-in-from-bottom-4 duration-700 space-y-8">
             <div className="text-center pb-6 border-b border-slate-200 break-inside-avoid">
               <div className="inline-flex items-center gap-2 bg-blue-100 text-blue-800 px-4 py-1 rounded-full text-[10px] font-black uppercase tracking-widest mb-4">
-                <Target className="w-3 h-3" /> Block Classification: {analysisBlockType || blockPurpose}
+                <Target className="w-3 h-3" /> Block Classification: {blockPurpose}
               </div>
               <h2 className="text-5xl font-black text-slate-900 mb-2 font-serif">{riderData.name || 'Athlete Profile'}</h2>
               {riderData.personaId && (
@@ -2956,7 +2221,7 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                   <Target className="w-4 h-4 text-blue-600" />
                   <p className="text-[10px] uppercase font-black text-slate-400 tracking-widest">Monthly Block Objective</p>
                 </div>
-                <p className="text-slate-800 font-medium leading-relaxed mb-4">{analysisBlockName || riderData.objective || "No specific objective provided for this block."}</p>
+                <p className="text-slate-800 font-medium leading-relaxed mb-4">{riderData.objective || "No specific objective provided for this block."}</p>
                 
                 <div className="bg-slate-50 rounded-xl p-4 border border-slate-100">
                    <p className="text-[10px] uppercase font-black text-slate-400 tracking-widest mb-2">Sans Chaine Perspective</p>
@@ -3063,10 +2328,10 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                                                                     <YAxis yAxisId="power" tick={{fontSize: 8}} stroke="#cbd5e1" axisLine={false} tickLine={false} domain={[0, 'dataMax + 50']} />
                                                                     <YAxis yAxisId="hr" hide domain={[50, 200]} />
                                                                     <RechartsTooltip contentStyle={{ fontSize: '10px', padding: '4px', borderRadius: '4px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} labelStyle={{ display: 'none' }} itemStyle={{ padding: 0, margin: 0 }} />
-                                                                    <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="target" stroke="#94a3b8" strokeDasharray="3 3" dot={false} strokeWidth={1.5} name="Target W" />
-                                                                    <Area isAnimationActive={false} yAxisId="power" type="linear" dataKey="watts" stroke="#3b82f6" fill="#eff6ff" strokeWidth={2} dot={false} name="Watts" />
-                                                                    <Line isAnimationActive={false} yAxisId="hr" type="linear" dataKey="hr" stroke="#ef4444" strokeWidth={1.5} dot={false} name="HR (bpm)" />
-                                                                    <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="cadence" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="Cadence" />
+                                                                    <Line isAnimationActive={false} yAxisId="power" type="monotone" dataKey="target" stroke="#94a3b8" strokeDasharray="3 3" dot={false} strokeWidth={1.5} name="Target W" />
+                                                                    <Area isAnimationActive={false} yAxisId="power" type="monotone" dataKey="watts" stroke="#3b82f6" fill="#eff6ff" strokeWidth={2} dot={false} name="Watts" />
+                                                                    <Line isAnimationActive={false} yAxisId="hr" type="monotone" dataKey="hr" stroke="#ef4444" strokeWidth={1.5} dot={false} name="HR (bpm)" />
+                                                                    <Line isAnimationActive={false} yAxisId="power" type="monotone" dataKey="cadence" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="Cadence" />
                                                                 </ComposedChart>
                                                             </ResponsiveContainer>
                                                         </div>
@@ -3141,28 +2406,16 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                 />
                 <div className="flex justify-between items-center mt-6 pt-6 border-t border-slate-100 no-print">
                     <button onClick={handleResetSession} className="text-xs font-black text-slate-400 uppercase hover:text-slate-600 transition tracking-widest">Reset & Start New</button>
-                    <div className="flex items-center gap-3">
-                      <button
-                        onClick={saveTrainingBlockAnalysis}
-                        disabled={isSavingBlock || !analysisBlockStart || !analysisBlockEnd || !analysisBlockType}
-                        className="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-4 rounded-xl font-bold transition shadow-xl text-xs uppercase tracking-[0.16em] flex items-center gap-2 disabled:bg-slate-300 disabled:cursor-not-allowed"
-                      >
-                        <Save className="w-4 h-4" />
-                        {isSavingBlock ? "Saving Block..." : "Save Block Analysis"}
-                      </button>
-                      <button 
-                        onClick={handleSavePdf} 
-                        disabled={isGeneratingPdf}
-                        className="bg-blue-600 hover:bg-blue-700 text-white px-10 py-4 rounded-xl font-bold transition shadow-xl text-xs uppercase tracking-[0.2em] flex items-center gap-2 disabled:bg-blue-400 disabled:cursor-not-allowed"
-                      >
-                        {isGeneratingPdf && <Cpu className="w-4 h-4 animate-spin" />}
-                        {isGeneratingPdf ? "Generating PDF..." : "Finalize Retrospective (Save PDF)"}
-                      </button>
-                    </div>
+                    <button 
+                      onClick={handleSavePdf} 
+                      disabled={isGeneratingPdf}
+                      className="bg-blue-600 hover:bg-blue-700 text-white px-10 py-4 rounded-xl font-bold transition shadow-xl text-xs uppercase tracking-[0.2em] flex items-center gap-2 disabled:bg-blue-400 disabled:cursor-not-allowed"
+                    >
+                      {isGeneratingPdf && <Cpu className="w-4 h-4 animate-spin" />}
+                      {isGeneratingPdf ? "Generating PDF..." : "Finalize Retrospective (Save PDF)"}
+                    </button>
                 </div>
             </Card>
-              </div>
-            )}
           </div>
         )}
       </main>

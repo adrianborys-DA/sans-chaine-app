@@ -99,21 +99,29 @@ const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
 
 // Keep the database chart samples aligned with the report chart.
-// For Block Analysis, the chart needs enough fidelity to show intervals.
-// Rule: save every parsed chart point unless the ride is extremely large; then evenly downsample.
-// This preserves the original local chart shape while avoiding oversized Supabase writes.
-const RIDE_CHART_SAMPLE_MAX_POINTS = 30000;
+// We do not store every timestamp, but we need enough density for short intervals.
+// This saves roughly one point every 1 second, capped to keep Supabase fast.
+const RIDE_CHART_SAMPLE_INTERVAL_SECONDS = 1;
+const RIDE_CHART_SAMPLE_MIN_POINTS = 240;
+const RIDE_CHART_SAMPLE_MAX_POINTS = 8000;
 
 const buildChartSamples = (dataPoints, avgWatts = 0) => {
   if (!Array.isArray(dataPoints) || dataPoints.length === 0) return [];
 
-  const step = Math.max(1, Math.ceil(dataPoints.length / RIDE_CHART_SAMPLE_MAX_POINTS));
+  const firstT = Number(dataPoints[0]?.t) || 0;
+  const lastT = Number(dataPoints[dataPoints.length - 1]?.t) || firstT;
+  const durationSeconds = Math.max(0, lastT - firstT);
+  const targetPoints = Math.min(
+    RIDE_CHART_SAMPLE_MAX_POINTS,
+    Math.max(RIDE_CHART_SAMPLE_MIN_POINTS, Math.ceil(durationSeconds / RIDE_CHART_SAMPLE_INTERVAL_SECONDS))
+  );
+  const step = Math.max(1, Math.floor(dataPoints.length / targetPoints));
   const samples = [];
 
   for (let i = 0; i < dataPoints.length; i += step) {
     const point = dataPoints[i];
     samples.push({
-      time: Number((Number(point.t || 0) / 60).toFixed(2)),
+      time: Number((point.t / 60).toFixed(2)),
       watts: Number(point.p) || 0,
       hr: Number(point.hr) || 0,
       cadence: Number(point.cad) || 0,
@@ -122,8 +130,9 @@ const buildChartSamples = (dataPoints, avgWatts = 0) => {
   }
 
   const lastPoint = dataPoints[dataPoints.length - 1];
-  const finalTime = Number((Number(lastPoint.t || 0) / 60).toFixed(2));
-  if (!samples.length || samples[samples.length - 1].time !== finalTime) {
+  const lastSampleTime = samples.length ? samples[samples.length - 1].time : null;
+  const finalTime = Number((lastPoint.t / 60).toFixed(2));
+  if (lastSampleTime !== finalTime) {
     samples.push({
       time: finalTime,
       watts: Number(lastPoint.p) || 0,
@@ -181,7 +190,7 @@ const compressRideTimeline = (dataPoints, gapThresholdSeconds = 15) => {
   });
 };
 
-const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => {
+const LongTermView = ({ riderId, riderName }) => {
   const [rides, setRides] = useState([]);
   const [blocks, setBlocks] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -192,8 +201,6 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
   const [selectedBlockId, setSelectedBlockId] = useState('');
   const [compareBlockAId, setCompareBlockAId] = useState('');
   const [compareBlockBId, setCompareBlockBId] = useState('');
-  const [longTermAnalysis, setLongTermAnalysis] = useState('');
-  const [isLongTermAnalyzing, setIsLongTermAnalyzing] = useState(false);
 
   useEffect(() => {
     const loadRidesAndBlocks = async () => {
@@ -358,73 +365,6 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
     focusChartOnBlocks(compareBlockAId, blockId);
   };
 
-  const formatLongTermRidesForAi = (rideList) => {
-    if (!rideList.length) return 'No rides are visible in the current Long-Term View.';
-    return rideList.map(ride => `- ${ride.ride_date} | ${ride.name || 'Ride'} | Duration: ${ride.duration_hours || 'N/A'}h | TSS: ${ride.tss || 'N/A'} | Avg Power: ${ride.avg_power || 'N/A'}W | NP: ${ride.normalized_power || 'N/A'}W | VI: ${ride.variability_index || 'N/A'} | Avg HR: ${ride.avg_hr || 'N/A'} bpm | Decoupling: ${ride.decoupling || 'N/A'}%`).join('\n');
-  };
-
-  const formatVisibleBlocksForAi = () => {
-    if (!blocks.length || !displayedChartData.length) return 'No saved blocks are visible in the current view.';
-    const rangeStart = displayedChartData[0]?.date;
-    const rangeEnd = displayedChartData[displayedChartData.length - 1]?.date;
-    const visibleBlocks = blocks.filter(block => block.end_date >= rangeStart && block.start_date <= rangeEnd);
-    if (!visibleBlocks.length) return 'No saved blocks overlap this selected view.';
-    return visibleBlocks.map(block => `- ${block.block_name || 'Unnamed Block'} | Type: ${block.block_type || 'Unclassified'} | ${block.start_date} to ${block.end_date} | Objective: ${block.objective || 'N/A'}`).join('\n');
-  };
-
-  const handleAnalyzeVisibleLongTermView = async () => {
-    if (!aiRequest) {
-      alert('AI is not configured for the Long-Term View.');
-      return;
-    }
-    if (!selectedRides.length) {
-      alert('There are no visible rides to analyze. Select a rider, block, or date range first.');
-      return;
-    }
-
-    setIsLongTermAnalyzing(true);
-    setLongTermAnalysis('Analyzing the visible long-term rider data...');
-
-    const kbString = knowledgeBase.map(kb => `[ARTICLE: ${kb.title}]\n${kb.content}`).join('\n\n');
-    const prompt = `Analyze the visible Long-Term View data for ${riderName || 'this rider'}.
-
-Visible Date Range:
-${activeRange ? `${activeRange.start} to ${activeRange.end}` : 'All visible rides'}
-
-Summary Metrics:
-- Rides: ${metrics.rideCount}
-- Total TSS: ${metrics.totalTss}
-- Total Hours: ${metrics.totalHours}
-- Avg Power: ${metrics.avgPower}W
-- Avg NP: ${metrics.avgNp}W
-- Avg VI: ${metrics.avgVi}
-- Avg Decoupling: ${metrics.avgDecoupling}%
-
-Visible Saved Blocks:
-${formatVisibleBlocksForAi()}
-
-Visible Ride Data:
-${formatLongTermRidesForAi(selectedRides)}
-
-Analyze only the data above. Explain what type of rider this appears to be, the overall performance trends, what is improving, what is lagging, risks/red flags, and what the next training emphasis should be.`;
-
-    const systemInstruction = `You are Andrew Randell, an expert cycling coach. This Long-Term View AI coach must only analyze the rides and blocks explicitly shown in the prompt.
-
-SANS CHAINE KNOWLEDGE BASE:
-${kbString}
-
-CRITICAL DATA RULES:
-- Only use the visible Long-Term View data provided in the prompt.
-- Do not reference workouts, blocks, WHOOP data, or dates that are not included.
-- If the visible range is small, say the conclusions are directional.
-- Focus on rider phenotype, durability, aerobic control, repeatability, training response, and long-term performance trends.
-- Be practical, direct, and coaching-oriented.`;
-
-    const responseText = await aiRequest(prompt, systemInstruction);
-    setLongTermAnalysis(responseText);
-    setIsLongTermAnalyzing(false);
-  };
-
   if (!riderId) {
     return (
       <div className="bg-white rounded-2xl border border-slate-200 p-8 shadow-sm">
@@ -445,14 +385,9 @@ CRITICAL DATA RULES:
             </p>
             {activeRange && <p className="text-xs font-bold text-blue-600 mt-2 uppercase">Selected: {activeRange.start} to {activeRange.end}</p>}
           </div>
-          <div className="flex flex-wrap gap-2">
-            <button onClick={handleAnalyzeVisibleLongTermView} disabled={isLongTermAnalyzing || selectedRides.length === 0} className={`px-4 py-2 rounded-lg text-xs font-bold uppercase transition ${isLongTermAnalyzing || selectedRides.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-sm'}`}>
-              {isLongTermAnalyzing ? 'Analyzing...' : 'AI Analyze View'}
-            </button>
-            <button onClick={clearSelection} className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-bold uppercase text-slate-700">
-              Clear Selection
-            </button>
-          </div>
+          <button onClick={clearSelection} className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-bold uppercase text-slate-700">
+            Clear Selection
+          </button>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 no-print">
@@ -556,18 +491,6 @@ CRITICAL DATA RULES:
         <MetricCard label="Avg VI" value={metrics.avgVi} />
         <MetricCard label="Avg Decoupling" value={`${metrics.avgDecoupling}%`} />
       </div>
-
-      {longTermAnalysis && (
-        <div className="bg-white rounded-2xl border border-blue-100 p-6 shadow-sm">
-          <div className="flex items-center gap-2 mb-3">
-            <Brain className="w-5 h-5 text-blue-600" />
-            <h3 className="text-xl font-black text-slate-900 font-serif">Long-Term AI Coach</h3>
-          </div>
-          <div className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap bg-blue-50/60 border border-blue-100 rounded-xl p-4">
-            {longTermAnalysis}
-          </div>
-        </div>
-      )}
 
       {(compareA || compareB) && (
         <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
@@ -862,26 +785,7 @@ const App = () => {
     }
   };
 
-  const startNewAnalysisBlock = () => {
-    setSelectedAnalysisBlockId('');
-    setAnalysisBlockStart('');
-    setAnalysisBlockEnd('');
-    setAnalysisBlockType('');
-    setAnalysisBlockName('');
-    setClosingStatement('');
-    setPerformanceData([]);
-    setRawRides([]);
-    setCollapsedWeeks({});
-    setDayReasons({});
-    setImportStatus('idle');
-  };
-
   const handleSavedAnalysisBlockSelect = (blockId) => {
-    if (!blockId) {
-      startNewAnalysisBlock();
-      return;
-    }
-
     setSelectedAnalysisBlockId(blockId);
     const block = savedAnalysisBlocks.find(b => b.id === blockId);
     if (!block) return;
@@ -1057,45 +961,20 @@ const App = () => {
         }, {});
       }
 
-      const { data: dbWhoopMetrics, error: whoopMetricsError } = await supabase
-        .from('whoop_metrics')
-        .select('*')
-        .eq('rider_id', riderData.supabaseId)
-        .gte('metric_date', analysisBlockStart)
-        .lte('metric_date', analysisBlockEnd);
-
-      if (whoopMetricsError) throw whoopMetricsError;
-
-      const loadedWhoopData = (dbWhoopMetrics || []).reduce((acc, row) => {
-        if (!row.metric_date) return acc;
-        acc[row.metric_date] = {
-          hrv: row.hrv !== null && row.hrv !== undefined ? Math.round(Number(row.hrv)) : null,
-          pulse: row.resting_hr !== null && row.resting_hr !== undefined ? Math.round(Number(row.resting_hr)) : null,
-          recovery: row.recovery !== null && row.recovery !== undefined ? Math.round(Number(row.recovery)) : null,
-          sleepHours: row.sleep_hours !== null && row.sleep_hours !== undefined ? Number(row.sleep_hours) : null,
-          timeInDeepSleep: row.time_in_deep_sleep !== null && row.time_in_deep_sleep !== undefined ? Number(row.time_in_deep_sleep) : null,
-          timeInLightSleep: row.time_in_light_sleep !== null && row.time_in_light_sleep !== undefined ? Number(row.time_in_light_sleep) : null,
-          timeInRemSleep: row.time_in_rem_sleep !== null && row.time_in_rem_sleep !== undefined ? Number(row.time_in_rem_sleep) : null,
-          timeAwake: row.time_awake !== null && row.time_awake !== undefined ? Number(row.time_awake) : null,
-          numberTimesWoken: row.number_times_woken !== null && row.number_times_woken !== undefined ? Number(row.number_times_woken) : null
-        };
-        return acc;
-      }, {});
-
       const loadedRides = (dbRides || []).map(ride => convertDbRideToAppRide(ride, samplesByRideId[ride.id] || []));
 
       setRawRides(loadedRides);
-      setWhoopData(loadedWhoopData);
+      setWhoopData({});
       setDayReasons({});
       setCollapsedWeeks({});
-      if (!selectedAnalysisBlockId) setClosingStatement('');
+      setClosingStatement('');
       setRiderData(prev => ({
         ...prev,
         startingDate: analysisBlockStart,
         endDate: analysisBlockEnd,
         objective: analysisBlockName || prev.objective
       }));
-      setPerformanceData(generateWeeks(loadedRides, analysisBlockStart, analysisBlockEnd, loadedWhoopData));
+      setPerformanceData(generateWeeks(loadedRides, analysisBlockStart, analysisBlockEnd, {}));
       setImportStatus(loadedRides.length > 0 ? 'success' : 'idle');
     } catch (error) {
       console.error('Block load failed:', JSON.stringify(error, null, 2));
@@ -1162,7 +1041,7 @@ const App = () => {
       if (savedBlock?.id) setSelectedAnalysisBlockId(savedBlock.id);
       await loadSavedAnalysisBlocksForRider(riderData.supabaseId);
 
-      alert(selectedAnalysisBlockId ? 'Training block updated.' : 'New training block saved.');
+      alert('Training block and coach report saved.');
     } catch (error) {
       console.error('Training block save failed:', JSON.stringify(error, null, 2));
       alert(`Training block save failed: ${error.message}`);
@@ -1431,20 +1310,7 @@ const App = () => {
         // Primary match by dedupe key; fallback by index so samples are never skipped after an upsert.
         const savedRide = savedRideByKey.get(dedupeKey) || savedRides?.[rideIndex];
 
-        const pointsSource =
-          originalRide?.chartData?.length > 0
-            ? originalRide.chartData
-            : originalRide?.sampleData?.length > 0
-              ? originalRide.sampleData.map(point => ({
-                  time: point.time_minutes,
-                  watts: point.watts,
-                  hr: point.heart_rate,
-                  cadence: point.cadence,
-                  target: point.target_power
-                }))
-              : [];
-
-        const pointsToSave = pointsSource.map((point, pointIndex) => ({
+        const pointsToSave = (originalRide?.chartData || []).map((point, pointIndex) => ({
           sample_index: pointIndex,
           time_minutes: Number(point.time) || 0,
           watts: Number(point.watts) || null,
@@ -1458,8 +1324,7 @@ const App = () => {
             rideName: originalRide?.name,
             dedupeKey,
             hasSavedRide: Boolean(savedRide),
-            chartPoints: originalRide?.chartData?.length || 0,
-            samplePoints: originalRide?.sampleData?.length || 0
+            chartPoints: originalRide?.chartData?.length || 0
           });
           return;
         }
@@ -1574,8 +1439,10 @@ const App = () => {
 
  // --- OpenAI API ---
   const fetchOpenAIResponse = async (prompt, systemInstruction) => {
+    const apiKey = import.meta.env.VITE_OPENAI_API_KEY; 
+    const url = `https://api.openai.com/v1/chat/completions`;
     const payload = {
-      model: "gpt-4o-mini",
+      model: "gpt-4o-mini", // You can change this to "gpt-3.5-turbo" if you want it to be cheaper/faster
       messages: [
         { role: "system", content: systemInstruction },
         { role: "user", content: prompt }
@@ -1583,49 +1450,32 @@ const App = () => {
       temperature: 0.7
     };
 
-    const callServerRoute = async () => {
-      const response = await fetch('/api/openai', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Server API HTTP ${response.status}: ${errorText}`);
-      }
-      const result = await response.json();
-      return result.choices?.[0]?.message?.content || result.content || "Sorry, I couldn't generate a response.";
-    };
-
-    const callBrowserFallback = async () => {
-      const apiKey = import.meta.env.VITE_OPENAI_API_KEY;
-      if (!apiKey) throw new Error('No client-side VITE_OPENAI_API_KEY found. Add OPENAI_API_KEY to Vercel for /api/openai, or VITE_OPENAI_API_KEY for local fallback.');
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`OpenAI HTTP ${response.status}: ${errorText}`);
-      }
-      const result = await response.json();
-      return result.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
-    };
-
-    try {
-      return await callServerRoute();
-    } catch (serverErr) {
-      console.warn('Server AI route failed, trying browser fallback:', serverErr);
+    const delays = [1000, 2000, 4000, 8000, 16000];
+    for (let i = 0; i < 6; i++) {
       try {
-        return await callBrowserFallback();
-      } catch (clientErr) {
-        console.error('OpenAI request failed:', clientErr);
-        return `Error: Unable to connect to the analysis engine. Details: ${clientErr.message}`;
-      }
+        const response = await fetch(url, { 
+          method: 'POST', 
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}` 
+          }, 
+          body: JSON.stringify(payload) 
+        });
+        if (!response.ok) {
+  const errorText = await response.text();
+  throw new Error(`HTTP ${response.status}: ${errorText}`);
+}
+        const result = await response.json();
+        return result.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
+      } catch (err) {
+  console.error("OpenAI request failed:", err);
+
+  if (i === 5) {
+    return `Error: Unable to connect to the analysis engine. Details: ${err.message}`;
+  }
+
+  await new Promise(resolve => setTimeout(resolve, delays[i]));
+}
     }
   };
 
@@ -2438,7 +2288,7 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
       <main className="max-w-7xl mx-auto px-6 pt-8 relative">
         
         {view === 'longterm' && (
-          <LongTermView riderId={riderData.supabaseId} riderName={riderData.name} aiRequest={fetchOpenAIResponse} knowledgeBase={knowledgeBase} />
+          <LongTermView riderId={riderData.supabaseId} riderName={riderData.name} />
         )}
 
         {/* === RIDER PROFILE & CONFIGURATION VIEW === */}
@@ -2907,7 +2757,6 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                     <option value="">New / Manual Block</option>
                     {savedAnalysisBlocks.map(block => <option key={block.id} value={block.id}>{block.start_date} to {block.end_date} · {block.block_type || 'Block'} · {block.block_name || 'Unnamed'}</option>)}
                   </select>
-                  <button type="button" onClick={startNewAnalysisBlock} className="mt-2 text-[10px] font-black uppercase text-blue-600 hover:text-blue-800">+ Start New Block</button>
                 </div>
                 <div>
                   <label className="text-[10px] font-bold text-slate-400 uppercase flex items-center gap-1"><CalendarIcon className="w-3 h-3"/> Block Start</label>
@@ -3063,10 +2912,10 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                                                                     <YAxis yAxisId="power" tick={{fontSize: 8}} stroke="#cbd5e1" axisLine={false} tickLine={false} domain={[0, 'dataMax + 50']} />
                                                                     <YAxis yAxisId="hr" hide domain={[50, 200]} />
                                                                     <RechartsTooltip contentStyle={{ fontSize: '10px', padding: '4px', borderRadius: '4px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} labelStyle={{ display: 'none' }} itemStyle={{ padding: 0, margin: 0 }} />
-                                                                    <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="target" stroke="#94a3b8" strokeDasharray="3 3" dot={false} strokeWidth={1.5} name="Target W" />
-                                                                    <Area isAnimationActive={false} yAxisId="power" type="linear" dataKey="watts" stroke="#3b82f6" fill="#eff6ff" strokeWidth={2} dot={false} name="Watts" />
-                                                                    <Line isAnimationActive={false} yAxisId="hr" type="linear" dataKey="hr" stroke="#ef4444" strokeWidth={1.5} dot={false} name="HR (bpm)" />
-                                                                    <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="cadence" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="Cadence" />
+                                                                    <Line isAnimationActive={false} yAxisId="power" type="monotone" dataKey="target" stroke="#94a3b8" strokeDasharray="3 3" dot={false} strokeWidth={1.5} name="Target W" />
+                                                                    <Area isAnimationActive={false} yAxisId="power" type="monotone" dataKey="watts" stroke="#3b82f6" fill="#eff6ff" strokeWidth={2} dot={false} name="Watts" />
+                                                                    <Line isAnimationActive={false} yAxisId="hr" type="monotone" dataKey="hr" stroke="#ef4444" strokeWidth={1.5} dot={false} name="HR (bpm)" />
+                                                                    <Line isAnimationActive={false} yAxisId="power" type="monotone" dataKey="cadence" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="Cadence" />
                                                                 </ComposedChart>
                                                             </ResponsiveContainer>
                                                         </div>

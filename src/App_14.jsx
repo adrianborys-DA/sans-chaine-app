@@ -102,7 +102,7 @@ const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supa
 // For Block Analysis, the chart needs enough fidelity to show intervals.
 // Rule: save every parsed chart point unless the ride is extremely large; then evenly downsample.
 // This preserves the original local chart shape while avoiding oversized Supabase writes.
-const RIDE_CHART_SAMPLE_MAX_POINTS = 30000;
+const RIDE_CHART_SAMPLE_MAX_POINTS = 15000;
 
 const buildChartSamples = (dataPoints, avgWatts = 0) => {
   if (!Array.isArray(dataPoints) || dataPoints.length === 0) return [];
@@ -181,7 +181,7 @@ const compressRideTimeline = (dataPoints, gapThresholdSeconds = 15) => {
   });
 };
 
-const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => {
+const LongTermView = ({ riderId, riderName }) => {
   const [rides, setRides] = useState([]);
   const [blocks, setBlocks] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -192,8 +192,6 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
   const [selectedBlockId, setSelectedBlockId] = useState('');
   const [compareBlockAId, setCompareBlockAId] = useState('');
   const [compareBlockBId, setCompareBlockBId] = useState('');
-  const [longTermAnalysis, setLongTermAnalysis] = useState('');
-  const [isLongTermAnalyzing, setIsLongTermAnalyzing] = useState(false);
 
   useEffect(() => {
     const loadRidesAndBlocks = async () => {
@@ -358,73 +356,6 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
     focusChartOnBlocks(compareBlockAId, blockId);
   };
 
-  const formatLongTermRidesForAi = (rideList) => {
-    if (!rideList.length) return 'No rides are visible in the current Long-Term View.';
-    return rideList.map(ride => `- ${ride.ride_date} | ${ride.name || 'Ride'} | Duration: ${ride.duration_hours || 'N/A'}h | TSS: ${ride.tss || 'N/A'} | Avg Power: ${ride.avg_power || 'N/A'}W | NP: ${ride.normalized_power || 'N/A'}W | VI: ${ride.variability_index || 'N/A'} | Avg HR: ${ride.avg_hr || 'N/A'} bpm | Decoupling: ${ride.decoupling || 'N/A'}%`).join('\n');
-  };
-
-  const formatVisibleBlocksForAi = () => {
-    if (!blocks.length || !displayedChartData.length) return 'No saved blocks are visible in the current view.';
-    const rangeStart = displayedChartData[0]?.date;
-    const rangeEnd = displayedChartData[displayedChartData.length - 1]?.date;
-    const visibleBlocks = blocks.filter(block => block.end_date >= rangeStart && block.start_date <= rangeEnd);
-    if (!visibleBlocks.length) return 'No saved blocks overlap this selected view.';
-    return visibleBlocks.map(block => `- ${block.block_name || 'Unnamed Block'} | Type: ${block.block_type || 'Unclassified'} | ${block.start_date} to ${block.end_date} | Objective: ${block.objective || 'N/A'}`).join('\n');
-  };
-
-  const handleAnalyzeVisibleLongTermView = async () => {
-    if (!aiRequest) {
-      alert('AI is not configured for the Long-Term View.');
-      return;
-    }
-    if (!selectedRides.length) {
-      alert('There are no visible rides to analyze. Select a rider, block, or date range first.');
-      return;
-    }
-
-    setIsLongTermAnalyzing(true);
-    setLongTermAnalysis('Analyzing the visible long-term rider data...');
-
-    const kbString = knowledgeBase.map(kb => `[ARTICLE: ${kb.title}]\n${kb.content}`).join('\n\n');
-    const prompt = `Analyze the visible Long-Term View data for ${riderName || 'this rider'}.
-
-Visible Date Range:
-${activeRange ? `${activeRange.start} to ${activeRange.end}` : 'All visible rides'}
-
-Summary Metrics:
-- Rides: ${metrics.rideCount}
-- Total TSS: ${metrics.totalTss}
-- Total Hours: ${metrics.totalHours}
-- Avg Power: ${metrics.avgPower}W
-- Avg NP: ${metrics.avgNp}W
-- Avg VI: ${metrics.avgVi}
-- Avg Decoupling: ${metrics.avgDecoupling}%
-
-Visible Saved Blocks:
-${formatVisibleBlocksForAi()}
-
-Visible Ride Data:
-${formatLongTermRidesForAi(selectedRides)}
-
-Analyze only the data above. Explain what type of rider this appears to be, the overall performance trends, what is improving, what is lagging, risks/red flags, and what the next training emphasis should be.`;
-
-    const systemInstruction = `You are Andrew Randell, an expert cycling coach. This Long-Term View AI coach must only analyze the rides and blocks explicitly shown in the prompt.
-
-SANS CHAINE KNOWLEDGE BASE:
-${kbString}
-
-CRITICAL DATA RULES:
-- Only use the visible Long-Term View data provided in the prompt.
-- Do not reference workouts, blocks, WHOOP data, or dates that are not included.
-- If the visible range is small, say the conclusions are directional.
-- Focus on rider phenotype, durability, aerobic control, repeatability, training response, and long-term performance trends.
-- Be practical, direct, and coaching-oriented.`;
-
-    const responseText = await aiRequest(prompt, systemInstruction);
-    setLongTermAnalysis(responseText);
-    setIsLongTermAnalyzing(false);
-  };
-
   if (!riderId) {
     return (
       <div className="bg-white rounded-2xl border border-slate-200 p-8 shadow-sm">
@@ -445,14 +376,9 @@ CRITICAL DATA RULES:
             </p>
             {activeRange && <p className="text-xs font-bold text-blue-600 mt-2 uppercase">Selected: {activeRange.start} to {activeRange.end}</p>}
           </div>
-          <div className="flex flex-wrap gap-2">
-            <button onClick={handleAnalyzeVisibleLongTermView} disabled={isLongTermAnalyzing || selectedRides.length === 0} className={`px-4 py-2 rounded-lg text-xs font-bold uppercase transition ${isLongTermAnalyzing || selectedRides.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-sm'}`}>
-              {isLongTermAnalyzing ? 'Analyzing...' : 'AI Analyze View'}
-            </button>
-            <button onClick={clearSelection} className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-bold uppercase text-slate-700">
-              Clear Selection
-            </button>
-          </div>
+          <button onClick={clearSelection} className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-bold uppercase text-slate-700">
+            Clear Selection
+          </button>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 no-print">
@@ -556,18 +482,6 @@ CRITICAL DATA RULES:
         <MetricCard label="Avg VI" value={metrics.avgVi} />
         <MetricCard label="Avg Decoupling" value={`${metrics.avgDecoupling}%`} />
       </div>
-
-      {longTermAnalysis && (
-        <div className="bg-white rounded-2xl border border-blue-100 p-6 shadow-sm">
-          <div className="flex items-center gap-2 mb-3">
-            <Brain className="w-5 h-5 text-blue-600" />
-            <h3 className="text-xl font-black text-slate-900 font-serif">Long-Term AI Coach</h3>
-          </div>
-          <div className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap bg-blue-50/60 border border-blue-100 rounded-xl p-4">
-            {longTermAnalysis}
-          </div>
-        </div>
-      )}
 
       {(compareA || compareB) && (
         <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
@@ -1574,8 +1488,10 @@ const App = () => {
 
  // --- OpenAI API ---
   const fetchOpenAIResponse = async (prompt, systemInstruction) => {
+    const apiKey = import.meta.env.VITE_OPENAI_API_KEY; 
+    const url = `https://api.openai.com/v1/chat/completions`;
     const payload = {
-      model: "gpt-4o-mini",
+      model: "gpt-4o-mini", // You can change this to "gpt-3.5-turbo" if you want it to be cheaper/faster
       messages: [
         { role: "system", content: systemInstruction },
         { role: "user", content: prompt }
@@ -1583,49 +1499,32 @@ const App = () => {
       temperature: 0.7
     };
 
-    const callServerRoute = async () => {
-      const response = await fetch('/api/openai', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Server API HTTP ${response.status}: ${errorText}`);
-      }
-      const result = await response.json();
-      return result.choices?.[0]?.message?.content || result.content || "Sorry, I couldn't generate a response.";
-    };
-
-    const callBrowserFallback = async () => {
-      const apiKey = import.meta.env.VITE_OPENAI_API_KEY;
-      if (!apiKey) throw new Error('No client-side VITE_OPENAI_API_KEY found. Add OPENAI_API_KEY to Vercel for /api/openai, or VITE_OPENAI_API_KEY for local fallback.');
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`OpenAI HTTP ${response.status}: ${errorText}`);
-      }
-      const result = await response.json();
-      return result.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
-    };
-
-    try {
-      return await callServerRoute();
-    } catch (serverErr) {
-      console.warn('Server AI route failed, trying browser fallback:', serverErr);
+    const delays = [1000, 2000, 4000, 8000, 16000];
+    for (let i = 0; i < 6; i++) {
       try {
-        return await callBrowserFallback();
-      } catch (clientErr) {
-        console.error('OpenAI request failed:', clientErr);
-        return `Error: Unable to connect to the analysis engine. Details: ${clientErr.message}`;
-      }
+        const response = await fetch(url, { 
+          method: 'POST', 
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}` 
+          }, 
+          body: JSON.stringify(payload) 
+        });
+        if (!response.ok) {
+  const errorText = await response.text();
+  throw new Error(`HTTP ${response.status}: ${errorText}`);
+}
+        const result = await response.json();
+        return result.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
+      } catch (err) {
+  console.error("OpenAI request failed:", err);
+
+  if (i === 5) {
+    return `Error: Unable to connect to the analysis engine. Details: ${err.message}`;
+  }
+
+  await new Promise(resolve => setTimeout(resolve, delays[i]));
+}
     }
   };
 
@@ -2438,7 +2337,7 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
       <main className="max-w-7xl mx-auto px-6 pt-8 relative">
         
         {view === 'longterm' && (
-          <LongTermView riderId={riderData.supabaseId} riderName={riderData.name} aiRequest={fetchOpenAIResponse} knowledgeBase={knowledgeBase} />
+          <LongTermView riderId={riderData.supabaseId} riderName={riderData.name} />
         )}
 
         {/* === RIDER PROFILE & CONFIGURATION VIEW === */}
@@ -3063,10 +2962,10 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                                                                     <YAxis yAxisId="power" tick={{fontSize: 8}} stroke="#cbd5e1" axisLine={false} tickLine={false} domain={[0, 'dataMax + 50']} />
                                                                     <YAxis yAxisId="hr" hide domain={[50, 200]} />
                                                                     <RechartsTooltip contentStyle={{ fontSize: '10px', padding: '4px', borderRadius: '4px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} labelStyle={{ display: 'none' }} itemStyle={{ padding: 0, margin: 0 }} />
-                                                                    <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="target" stroke="#94a3b8" strokeDasharray="3 3" dot={false} strokeWidth={1.5} name="Target W" />
-                                                                    <Area isAnimationActive={false} yAxisId="power" type="linear" dataKey="watts" stroke="#3b82f6" fill="#eff6ff" strokeWidth={2} dot={false} name="Watts" />
-                                                                    <Line isAnimationActive={false} yAxisId="hr" type="linear" dataKey="hr" stroke="#ef4444" strokeWidth={1.5} dot={false} name="HR (bpm)" />
-                                                                    <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="cadence" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="Cadence" />
+                                                                    <Line isAnimationActive={false} yAxisId="power" type="monotone" dataKey="target" stroke="#94a3b8" strokeDasharray="3 3" dot={false} strokeWidth={1.5} name="Target W" />
+                                                                    <Area isAnimationActive={false} yAxisId="power" type="monotone" dataKey="watts" stroke="#3b82f6" fill="#eff6ff" strokeWidth={2} dot={false} name="Watts" />
+                                                                    <Line isAnimationActive={false} yAxisId="hr" type="monotone" dataKey="hr" stroke="#ef4444" strokeWidth={1.5} dot={false} name="HR (bpm)" />
+                                                                    <Line isAnimationActive={false} yAxisId="power" type="monotone" dataKey="cadence" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="Cadence" />
                                                                 </ComposedChart>
                                                             </ResponsiveContainer>
                                                         </div>
