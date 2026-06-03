@@ -198,6 +198,26 @@ const fetchRideSamplesByRideIds = async (rideIds = []) => {
   return samplesByRideId;
 };
 
+const fetchRideSegmentsByRideIds = async (rideIds = []) => {
+  if (!supabase || !Array.isArray(rideIds) || rideIds.length === 0) return {};
+
+  const segmentsByRideId = {};
+  const { data, error } = await supabase
+    .from('ride_segments')
+    .select('*')
+    .in('ride_id', rideIds)
+    .order('segment_index', { ascending: true });
+
+  if (error) throw error;
+
+  (data || []).forEach(segment => {
+    if (!segmentsByRideId[segment.ride_id]) segmentsByRideId[segment.ride_id] = [];
+    segmentsByRideId[segment.ride_id].push(segment);
+  });
+
+  return segmentsByRideId;
+};
+
 const LONG_TERM_METRIC_CONFIG = [
   { key: 'tss', label: 'TSS', suffix: '', axis: 'left', chartType: 'bar', color: '#bfdbfe' },
   { key: 'duration', label: 'Duration', suffix: 'h', axis: 'left', chartType: 'line', color: '#64748b' },
@@ -394,7 +414,7 @@ const compressRideTimeline = (dataPoints, gapThresholdSeconds = 15) => {
   });
 };
 
-const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => {
+const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [], onAddToReport }) => {
   const [rides, setRides] = useState([]);
   const [blocks, setBlocks] = useState([]);
   const [whoopMetrics, setWhoopMetrics] = useState([]);
@@ -416,7 +436,39 @@ const LongTermView = ({ riderId, riderName, aiRequest, knowledgeBase = [] }) => 
         setErrorMessage('Supabase is not configured. Check VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.');
         return;
       }
-      if (!riderId) {
+      const handleAddLongTermChartToReport = async () => {
+    if (!onAddToReport) return;
+    await onAddToReport({
+      sectionType: 'chart',
+      sectionTitle: 'Long-Term Trend Chart',
+      content: `Long-Term chart for ${riderName || 'this rider'} with ${displayedChartData.length} visible data points.`,
+      chartConfig: {
+        chartType: hasTwoBlockComparison ? 'block_comparison' : 'long_term_trend',
+        chartTitle: hasTwoBlockComparison ? 'Block Comparison Chart' : 'Long-Term Trend Chart',
+        description: activeRange ? `${activeRange.start} to ${activeRange.end}` : 'All visible rides',
+        activeRange,
+        compareBlockAId,
+        compareBlockBId,
+        metrics: ['TSS', 'NP', 'Avg HR', 'Decoupling', 'WHOOP Recovery', 'Sleep'],
+        dataPreview: displayedChartData.slice(0, 200)
+      },
+      sourceType: 'long_term',
+      sourceId: `${riderId}-${activeRange?.start || 'all'}-${activeRange?.end || 'all'}`
+    });
+  };
+
+  const handleAddLongTermInsightToReport = async () => {
+    if (!onAddToReport || !longTermAnalysis) return;
+    await onAddToReport({
+      sectionType: 'ai_insight',
+      sectionTitle: 'Long-Term AI Coach Insight',
+      content: longTermAnalysis,
+      sourceType: 'long_term_ai',
+      sourceId: `${riderId}-${Date.now()}`
+    });
+  };
+
+  if (!riderId) {
         setRides([]);
         setBlocks([]);
         setWhoopMetrics([]);
@@ -731,6 +783,38 @@ CRITICAL DATA RULES:
     setIsLongTermAnalyzing(false);
   };
 
+  const handleAddLongTermChartToReport = async () => {
+    if (!onAddToReport) return;
+    await onAddToReport({
+      sectionType: 'chart',
+      sectionTitle: 'Long-Term Trend Chart',
+      content: `Long-Term chart for ${riderName || 'this rider'} with ${displayedChartData.length} visible data points.`,
+      chartConfig: {
+        chartType: hasTwoBlockComparison ? 'block_comparison' : 'long_term_trend',
+        chartTitle: hasTwoBlockComparison ? 'Block Comparison Chart' : 'Long-Term Trend Chart',
+        description: activeRange ? `${activeRange.start} to ${activeRange.end}` : 'All visible rides',
+        activeRange,
+        compareBlockAId,
+        compareBlockBId,
+        metrics: ['TSS', 'NP', 'Avg HR', 'Decoupling', 'WHOOP Recovery', 'Sleep'],
+        dataPreview: displayedChartData.slice(0, 200)
+      },
+      sourceType: 'long_term',
+      sourceId: `${riderId}-${activeRange?.start || 'all'}-${activeRange?.end || 'all'}`
+    });
+  };
+
+  const handleAddLongTermInsightToReport = async () => {
+    if (!onAddToReport || !longTermAnalysis) return;
+    await onAddToReport({
+      sectionType: 'ai_insight',
+      sectionTitle: 'Long-Term AI Coach Insight',
+      content: longTermAnalysis,
+      sourceType: 'long_term_ai',
+      sourceId: `${riderId}-${Date.now()}`
+    });
+  };
+
   if (!riderId) {
     return (
       <div className="bg-white rounded-2xl border border-slate-200 p-8 shadow-sm">
@@ -754,6 +838,9 @@ CRITICAL DATA RULES:
           <div className="flex flex-wrap gap-2">
             <button onClick={handleAnalyzeVisibleLongTermView} disabled={isLongTermAnalyzing || selectedRides.length === 0} className={`px-4 py-2 rounded-lg text-xs font-bold uppercase transition ${isLongTermAnalyzing || selectedRides.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-sm'}`}>
               {isLongTermAnalyzing ? 'Analyzing...' : 'AI Analyze View'}
+            </button>
+            <button onClick={handleAddLongTermChartToReport} disabled={!displayedChartData.length} className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-slate-900 text-xs font-bold uppercase disabled:bg-slate-200 disabled:text-slate-400">
+              Add Chart to Report
             </button>
             <button onClick={clearSelection} className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-bold uppercase text-slate-700">
               Clear Selection
@@ -894,9 +981,12 @@ CRITICAL DATA RULES:
 
       {longTermAnalysis && (
         <div className="bg-white rounded-2xl border border-blue-100 p-6 shadow-sm">
-          <div className="flex items-center gap-2 mb-3">
-            <Brain className="w-5 h-5 text-blue-600" />
-            <h3 className="text-xl font-black text-slate-900 font-serif">Long-Term AI Coach</h3>
+          <div className="flex items-center justify-between gap-2 mb-3">
+            <div className="flex items-center gap-2">
+              <Brain className="w-5 h-5 text-blue-600" />
+              <h3 className="text-xl font-black text-slate-900 font-serif">Long-Term AI Coach</h3>
+            </div>
+            <button onClick={handleAddLongTermInsightToReport} className="no-print px-3 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-slate-900 text-[10px] font-black uppercase">Add Insight to Report</button>
           </div>
           <div className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap bg-blue-50/60 border border-blue-100 rounded-xl p-4">
             {longTermAnalysis}
@@ -939,6 +1029,598 @@ const MetricCard = ({ label, value }) => (
   </div>
 );
 
+const ReportBuilder = ({ supabaseClient, riderData, currentUser, activeReportId, setActiveReportId }) => {
+  const [reports, setReports] = useState([]);
+  const [selectedReportId, setSelectedReportId] = useState(activeReportId || '');
+  const [sections, setSections] = useState([]);
+  const [isLoadingReports, setIsLoadingReports] = useState(false);
+  const [isSavingReport, setIsSavingReport] = useState(false);
+  const [newReportTitle, setNewReportTitle] = useState('');
+  const [builderStatus, setBuilderStatus] = useState('');
+
+  const loadReports = async () => {
+    if (!supabaseClient || !riderData?.supabaseId) {
+      setReports([]);
+      setSections([]);
+      return;
+    }
+
+    setIsLoadingReports(true);
+    try {
+      const { data, error } = await supabaseClient
+        .from('custom_reports')
+        .select('*')
+        .eq('rider_id', riderData.supabaseId)
+        .order('updated_at', { ascending: false });
+
+      if (error) throw error;
+      setReports(data || []);
+
+      const reportToSelect = activeReportId || selectedReportId || data?.[0]?.id || '';
+      if (reportToSelect) {
+        setSelectedReportId(reportToSelect);
+        setActiveReportId?.(reportToSelect);
+        await loadSections(reportToSelect);
+      } else {
+        setSections([]);
+      }
+    } catch (error) {
+      console.error('Report load failed:', JSON.stringify(error, null, 2));
+      setBuilderStatus(`Report load failed: ${error.message}`);
+    } finally {
+      setIsLoadingReports(false);
+    }
+  };
+
+  const loadSections = async (reportId) => {
+    if (!supabaseClient || !reportId) {
+      setSections([]);
+      return;
+    }
+
+    const { data, error } = await supabaseClient
+      .from('custom_report_sections')
+      .select('*')
+      .eq('report_id', reportId)
+      .order('section_order', { ascending: true });
+
+    if (error) throw error;
+    setSections(data || []);
+  };
+
+  useEffect(() => {
+    loadReports();
+  }, [riderData?.supabaseId]);
+
+  useEffect(() => {
+    if (activeReportId && activeReportId !== selectedReportId) {
+      setSelectedReportId(activeReportId);
+      loadSections(activeReportId).catch(error => setBuilderStatus(`Section load failed: ${error.message}`));
+    }
+  }, [activeReportId]);
+
+  const createReport = async () => {
+    if (!supabaseClient || !riderData?.supabaseId) {
+      alert('Select or save a rider before creating a report.');
+      return;
+    }
+
+    setIsSavingReport(true);
+    try {
+      const title = newReportTitle.trim() || `${riderData.name || 'Rider'} Custom Report ${new Date().toISOString().slice(0, 10)}`;
+      const { data, error } = await supabaseClient
+        .from('custom_reports')
+        .insert({
+          rider_id: riderData.supabaseId,
+          report_title: title,
+          report_type: 'custom',
+          start_date: riderData.startingDate || null,
+          end_date: riderData.endDate || null,
+          created_by: currentUser?.id || null,
+          updated_at: new Date().toISOString()
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+      setNewReportTitle('');
+      setSelectedReportId(data.id);
+      setActiveReportId?.(data.id);
+      setSections([]);
+      await loadReports();
+      setBuilderStatus('Report created.');
+    } catch (error) {
+      console.error('Create report failed:', JSON.stringify(error, null, 2));
+      alert(`Create report failed: ${error.message}`);
+    } finally {
+      setIsSavingReport(false);
+    }
+  };
+
+  const handleSelectReport = async (reportId) => {
+    setSelectedReportId(reportId);
+    setActiveReportId?.(reportId);
+    try {
+      await loadSections(reportId);
+    } catch (error) {
+      console.error('Section load failed:', JSON.stringify(error, null, 2));
+      setBuilderStatus(`Section load failed: ${error.message}`);
+    }
+  };
+
+  const updateSectionContent = async (sectionId, patch) => {
+    const nextSections = sections.map(section => section.id === sectionId ? { ...section, ...patch } : section);
+    setSections(nextSections);
+
+    const { error } = await supabaseClient
+      .from('custom_report_sections')
+      .update({ ...patch, updated_at: new Date().toISOString() })
+      .eq('id', sectionId);
+
+    if (error) {
+      console.error('Section update failed:', error);
+      setBuilderStatus(`Section update failed: ${error.message}`);
+    }
+  };
+
+  const deleteSection = async (sectionId) => {
+    if (!confirm('Delete this report section?')) return;
+
+    const { error } = await supabaseClient
+      .from('custom_report_sections')
+      .delete()
+      .eq('id', sectionId);
+
+    if (error) {
+      alert(`Delete failed: ${error.message}`);
+      return;
+    }
+
+    const remaining = sections.filter(section => section.id !== sectionId)
+      .map((section, index) => ({ ...section, section_order: index + 1 }));
+    setSections(remaining);
+
+    for (const section of remaining) {
+      await supabaseClient
+        .from('custom_report_sections')
+        .update({ section_order: section.section_order, updated_at: new Date().toISOString() })
+        .eq('id', section.id);
+    }
+  };
+
+  const moveSection = async (sectionId, direction) => {
+    const index = sections.findIndex(section => section.id === sectionId);
+    const targetIndex = index + direction;
+    if (index < 0 || targetIndex < 0 || targetIndex >= sections.length) return;
+
+    const reordered = [...sections];
+    [reordered[index], reordered[targetIndex]] = [reordered[targetIndex], reordered[index]];
+    const normalized = reordered.map((section, orderIndex) => ({ ...section, section_order: orderIndex + 1 }));
+    setSections(normalized);
+
+    for (const section of normalized) {
+      await supabaseClient
+        .from('custom_report_sections')
+        .update({ section_order: section.section_order, updated_at: new Date().toISOString() })
+        .eq('id', section.id);
+    }
+  };
+
+  const exportPdf = async () => {
+    const sourceElement = document.getElementById('custom-report-export');
+    if (!sourceElement) return;
+
+    if (!sections.length) {
+      alert('Add at least one section before exporting the report.');
+      return;
+    }
+
+    // Print from a dedicated print root. This keeps the app UI out of the
+    // print flow while allowing the report itself to paginate normally.
+    document.getElementById('custom-report-print-root')?.remove();
+    document.getElementById('custom-report-print-style')?.remove();
+
+    const textareaValues = Array.from(sourceElement.querySelectorAll('textarea')).map(ta => ta.value || ta.textContent || '');
+    const printRoot = sourceElement.cloneNode(true);
+    printRoot.id = 'custom-report-print-root';
+
+    printRoot.querySelectorAll('.no-print, .pdf-hide, button').forEach(node => node.remove());
+
+    Array.from(printRoot.querySelectorAll('textarea')).forEach((ta, index) => {
+      const div = document.createElement('div');
+      div.className = 'pdf-print-text-block';
+      div.textContent = textareaValues[index] || ta.value || ta.textContent || '';
+      ta.replaceWith(div);
+    });
+
+    printRoot.querySelectorAll('.hidden.print\:block').forEach(node => {
+      node.classList.remove('hidden');
+      node.style.display = 'block';
+    });
+
+    const style = document.createElement('style');
+    style.id = 'custom-report-print-style';
+    style.textContent = `
+      @media screen {
+        #custom-report-print-root {
+          position: fixed !important;
+          left: -10000px !important;
+          top: 0 !important;
+          width: 7.25in !important;
+          max-width: 7.25in !important;
+          background: #ffffff !important;
+          color: #0f172a !important;
+          pointer-events: none !important;
+        }
+      }
+
+      @media print {
+        @page { size: letter portrait; margin: 0.45in; }
+
+        html, body {
+          width: auto !important;
+          height: auto !important;
+          min-height: 0 !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          overflow: visible !important;
+          background: #ffffff !important;
+          -webkit-print-color-adjust: exact !important;
+          print-color-adjust: exact !important;
+        }
+
+        body > *:not(#custom-report-print-root) {
+          display: none !important;
+        }
+
+        #custom-report-print-root {
+          display: block !important;
+          position: static !important;
+          left: auto !important;
+          top: auto !important;
+          width: 100% !important;
+          max-width: none !important;
+          min-width: 0 !important;
+          min-height: 0 !important;
+          height: auto !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          overflow: visible !important;
+          background: #ffffff !important;
+          color: #0f172a !important;
+          box-shadow: none !important;
+          border: none !important;
+          border-radius: 0 !important;
+        }
+
+        #custom-report-print-root * {
+          visibility: visible !important;
+          max-width: 100% !important;
+          box-sizing: border-box !important;
+        }
+
+        #custom-report-print-root .no-print,
+        #custom-report-print-root .pdf-hide,
+        #custom-report-print-root button {
+          display: none !important;
+          visibility: hidden !important;
+        }
+
+        #custom-report-print-root .report-section-card {
+          display: block !important;
+          width: 100% !important;
+          height: auto !important;
+          max-height: none !important;
+          overflow: visible !important;
+          page-break-inside: auto !important;
+          break-inside: auto !important;
+          margin-bottom: 18px !important;
+          box-shadow: none !important;
+        }
+
+        #custom-report-print-root .recharts-responsive-container,
+        #custom-report-print-root .recharts-wrapper,
+        #custom-report-print-root .recharts-surface {
+          width: 100% !important;
+          max-width: 100% !important;
+          overflow: visible !important;
+        }
+
+        #custom-report-print-root svg {
+          max-width: 100% !important;
+          overflow: visible !important;
+        }
+
+        #custom-report-print-root table {
+          width: 100% !important;
+          border-collapse: collapse !important;
+          page-break-inside: auto !important;
+        }
+
+        #custom-report-print-root tr {
+          page-break-inside: avoid !important;
+          break-inside: avoid !important;
+        }
+
+        #custom-report-print-root p,
+        #custom-report-print-root div,
+        #custom-report-print-root span,
+        #custom-report-print-root h1,
+        #custom-report-print-root h2,
+        #custom-report-print-root h3,
+        #custom-report-print-root h4,
+        #custom-report-print-root td,
+        #custom-report-print-root th {
+          overflow-wrap: anywhere !important;
+          word-break: normal !important;
+        }
+
+        .pdf-print-text-block {
+          display: block !important;
+          white-space: pre-wrap !important;
+          line-height: 1.65 !important;
+          font-size: 12px !important;
+          color: #334155 !important;
+          border: 1px solid #e2e8f0 !important;
+          border-radius: 12px !important;
+          padding: 14px !important;
+          background: #f8fafc !important;
+          width: 100% !important;
+          max-width: 100% !important;
+          height: auto !important;
+          max-height: none !important;
+          overflow: visible !important;
+        }
+      }
+    `;
+
+    const cleanup = () => {
+      document.getElementById('custom-report-print-root')?.remove();
+      document.getElementById('custom-report-print-style')?.remove();
+      window.removeEventListener('afterprint', cleanup);
+    };
+
+    try {
+      document.head.appendChild(style);
+      document.body.appendChild(printRoot);
+
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      window.addEventListener('afterprint', cleanup);
+      window.print();
+
+      setTimeout(cleanup, 60000);
+    } catch (error) {
+      cleanup();
+      console.error('Custom report print export failed:', error);
+      alert(`PDF export failed: ${error.message}`);
+    }
+  };
+
+  const renderMetricPills = (metrics = {}) => {
+    const entries = Object.entries(metrics || {}).filter(([, value]) => value !== null && value !== undefined && value !== '');
+    if (!entries.length) return null;
+    return (
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-2 mb-4">
+        {entries.map(([key, value]) => (
+          <div key={key} className="rounded-lg border border-slate-100 bg-white p-2 text-center">
+            <p className="text-[8px] uppercase tracking-wide font-black text-slate-400">{key.replace(/([A-Z])/g, ' $1')}</p>
+            <p className="text-sm font-black text-slate-800">{String(value)}</p>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  const renderReportChart = (section) => {
+    const cfg = section.chart_config || {};
+    const chartData = Array.isArray(cfg.chartData) ? cfg.chartData : (Array.isArray(cfg.dataPreview) ? cfg.dataPreview : []);
+
+    if (cfg.chartType === 'selected_ride_detail') {
+      return (
+        <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 overflow-visible">
+          <div className="mb-3">
+            <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">Ride detail chart</p>
+            <h4 className="font-black text-slate-900">{cfg.chartTitle || section.section_title}</h4>
+            <p className="text-xs text-slate-500">{cfg.rideDate || ''}{cfg.zoomRange ? ` · Zoom ${Number(cfg.zoomRange.start).toFixed(1)}–${Number(cfg.zoomRange.end).toFixed(1)} min` : ''}</p>
+          </div>
+          {renderMetricPills(cfg.displayMetrics)}
+          {chartData.length > 0 ? (
+            <div className="h-[320px] bg-white rounded-xl border border-slate-100 p-3">
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={chartData} margin={{ top: 10, right: 24, left: -8, bottom: 16 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                  <XAxis dataKey="time" type="number" domain={[0, 'dataMax']} tick={{ fontSize: 10 }} tickLine={false} axisLine={false} label={{ value: 'Minutes', position: 'insideBottomRight', offset: -4, fontSize: 10 }} />
+                  <YAxis yAxisId="power" tick={{ fontSize: 10 }} stroke="#94a3b8" axisLine={false} tickLine={false} domain={[0, 'dataMax + 50']} />
+                  <YAxis yAxisId="hr" orientation="right" tick={{ fontSize: 10 }} stroke="#ef4444" axisLine={false} tickLine={false} domain={[50, 200]} />
+                  <RechartsTooltip labelFormatter={(label) => `${label} min`} />
+                  <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="target" stroke="#94a3b8" strokeDasharray="3 3" dot={false} strokeWidth={1.3} name="Target W" />
+                  <Area isAnimationActive={false} yAxisId="power" type="linear" dataKey="watts" stroke="#3b82f6" fill="#eff6ff" strokeWidth={1.6} dot={false} name="Watts" />
+                  <Line isAnimationActive={false} yAxisId="hr" type="linear" dataKey="hr" stroke="#ef4444" strokeWidth={1.4} dot={false} name="HR" />
+                  <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="cadence" stroke="#f59e0b" strokeWidth={1.2} dot={false} name="Cadence" />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+          ) : <p className="text-sm text-slate-500">No chart data was saved with this section. Re-add the chart from Block Analysis.</p>}
+        </div>
+      );
+    }
+
+    if (cfg.chartType === 'long_term_trend' || cfg.chartType === 'block_comparison') {
+      return (
+        <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 overflow-visible">
+          <div className="mb-3">
+            <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">Long-term chart</p>
+            <h4 className="font-black text-slate-900">{cfg.chartTitle || section.section_title}</h4>
+            <p className="text-xs text-slate-500">{cfg.description || section.content}</p>
+          </div>
+          {chartData.length > 0 ? (
+            <div className="h-[320px] bg-white rounded-xl border border-slate-100 p-3">
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={chartData} margin={{ top: 10, right: 20, left: -8, bottom: 16 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey="date" tick={{ fontSize: 10 }} />
+                  <YAxis yAxisId="left" tick={{ fontSize: 10 }} />
+                  <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 10 }} />
+                  <RechartsTooltip />
+                  <Bar yAxisId="left" dataKey="tss" name="TSS" fill="#bfdbfe" radius={[4, 4, 0, 0]} />
+                  <Line isAnimationActive={false} yAxisId="right" type="linear" dataKey="normalizedPower" name="NP" stroke="#3b82f6" strokeWidth={2} dot={false} />
+                  <Line isAnimationActive={false} yAxisId="right" type="linear" dataKey="avgHr" name="Avg HR" stroke="#ef4444" strokeWidth={2} dot={false} />
+                  <Line isAnimationActive={false} yAxisId="right" type="linear" dataKey="recovery" name="Recovery" stroke="#10b981" strokeWidth={2} dot={false} />
+                  <Line isAnimationActive={false} yAxisId="right" type="linear" dataKey="sleepHours" name="Sleep" stroke="#8b5cf6" strokeWidth={2} dot={false} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+          ) : <p className="text-sm text-slate-500">No chart data was saved with this section. Re-add the chart from Long-Term View.</p>}
+        </div>
+      );
+    }
+
+    return (
+      <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+        <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">Saved Chart</p>
+        <p className="font-black text-slate-800 mt-1">{cfg.chartTitle || section.section_title}</p>
+        <p className="text-xs text-slate-500 mt-1">{cfg.description || section.content || 'No chart renderer is available for this saved chart type.'}</p>
+      </div>
+    );
+  };
+
+  const renderSegmentTable = (section) => {
+    const cfg = section.chart_config || {};
+    const segments = Array.isArray(cfg.segments) ? cfg.segments : [];
+    if (!segments.length) {
+      return <textarea className="w-full min-h-[140px] text-sm text-slate-700 leading-relaxed bg-slate-50 border border-slate-200 rounded-xl p-4 outline-none focus:border-blue-300" value={section.content || ''} onChange={(e) => updateSectionContent(section.id, { content: e.target.value })} />;
+    }
+    return (
+      <div className="overflow-x-auto rounded-xl border border-slate-200">
+        <table className="w-full text-xs bg-white">
+          <thead className="bg-slate-50 text-slate-500 uppercase">
+            <tr>
+              <th className="text-left p-3">#</th><th className="text-left p-3">Type</th><th className="text-right p-3">Duration</th><th className="text-right p-3">Target</th><th className="text-right p-3">Actual</th><th className="text-right p-3">Seg</th><th className="text-right p-3">Pwr</th><th className="text-right p-3">HR</th><th className="text-left p-3">Note</th>
+            </tr>
+          </thead>
+          <tbody>
+            {segments.map(segment => (
+              <tr key={segment.segment_index || segment.id} className="border-t border-slate-100">
+                <td className="p-3 font-bold">{segment.segment_index}</td>
+                <td className="p-3 font-bold capitalize">{segment.segment_type || 'segment'}</td>
+                <td className="p-3 text-right">{Math.round(Number(segment.duration_seconds) || 0)}s</td>
+                <td className="p-3 text-right">{segment.target_power_zone || ''} {segment.target_power_low || 'N/A'}–{segment.target_power_high || '+'}W</td>
+                <td className="p-3 text-right">{Math.round(Number(segment.avg_power) || 0)}W / {Math.round(Number(segment.avg_hr) || 0)} bpm</td>
+                <td className="p-3 text-right font-black">{segment.segment_score || 'N/A'}</td>
+                <td className="p-3 text-right">{segment.power_score ?? 'N/A'}</td>
+                <td className="p-3 text-right">{segment.hr_score ?? 'N/A'}</td>
+                <td className="p-3 text-slate-600 min-w-[240px]">{segment.coaching_note || ''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
+
+  const renderReportSectionContent = (section) => {
+    if (section.section_type === 'chart') return renderReportChart(section);
+    if (section.section_type === 'table') return renderSegmentTable(section);
+    return (
+      <>
+        <textarea
+          className="no-print w-full min-h-[180px] text-sm text-slate-700 leading-relaxed bg-slate-50 border border-slate-200 rounded-xl p-4 outline-none focus:border-blue-300"
+          value={section.content || ''}
+          onChange={(e) => updateSectionContent(section.id, { content: e.target.value })}
+        />
+        <div className="hidden print:block text-sm text-slate-700 leading-relaxed whitespace-pre-wrap bg-slate-50 border border-slate-200 rounded-xl p-4">
+          {section.content || ''}
+        </div>
+      </>
+    );
+  };
+
+  const selectedReport = reports.find(report => report.id === selectedReportId);
+
+  return (
+    <div className="space-y-6 animate-in fade-in duration-500">
+      <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+        <div className="flex flex-col md:flex-row md:items-start justify-between gap-4 mb-6">
+          <div>
+            <h2 className="text-3xl font-black text-slate-900 font-serif">Custom Report Builder</h2>
+            <p className="text-sm text-slate-500 mt-1">Collect charts, AI insights, chatbot answers, and coach notes into an editable report.</p>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={loadReports} className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-bold uppercase text-slate-700">Refresh</button>
+            <button onClick={exportPdf} disabled={!sections.length} className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold uppercase disabled:bg-slate-300">Export PDF</button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+          <div className="md:col-span-2">
+            <label className="text-[10px] font-bold text-slate-400 uppercase">Saved Reports</label>
+            <select value={selectedReportId} onChange={(e) => handleSelectReport(e.target.value)} className="w-full mt-1 p-2 border border-slate-200 rounded-lg text-sm bg-slate-50">
+              <option value="">Select a report...</option>
+              {reports.map(report => <option key={report.id} value={report.id}>{report.report_title}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="text-[10px] font-bold text-slate-400 uppercase">New Report Title</label>
+            <div className="flex gap-2 mt-1">
+              <input value={newReportTitle} onChange={(e) => setNewReportTitle(e.target.value)} placeholder="Report title" className="w-full p-2 border border-slate-200 rounded-lg text-sm" />
+              <button onClick={createReport} disabled={isSavingReport} className="px-3 py-2 bg-slate-900 text-white rounded-lg text-xs font-bold uppercase">Create</button>
+            </div>
+          </div>
+        </div>
+
+        {builderStatus && <div className="mb-4 rounded-lg bg-blue-50 border border-blue-100 p-3 text-sm text-blue-700">{builderStatus}</div>}
+
+        {!riderData?.supabaseId && <p className="text-sm text-slate-500">Select and save a rider before creating reports.</p>}
+        {riderData?.supabaseId && !selectedReportId && <p className="text-sm text-slate-500">Create or select a report. Use “Add to Report” buttons across Block Analysis, Long-Term View, and Chat to add sections.</p>}
+      </div>
+
+      {selectedReportId && (
+        <div id="custom-report-export" className="bg-white rounded-2xl border border-slate-200 p-8 shadow-sm space-y-6 overflow-visible max-w-none">
+          <div className="border-b border-slate-200 pb-4">
+            <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">Sans Chaine Custom Report</p>
+            <h1 className="text-3xl font-black text-slate-900 font-serif mt-1">{selectedReport?.report_title || 'Custom Report'}</h1>
+            <p className="text-sm text-slate-500 mt-1">{riderData?.name || 'Rider'} · {selectedReport?.start_date || ''} {selectedReport?.end_date ? `to ${selectedReport.end_date}` : ''}</p>
+          </div>
+
+          {sections.length === 0 ? (
+            <p className="text-sm text-slate-500">No sections yet. Add sections from Block Analysis, Long-Term View, or Chat.</p>
+          ) : (
+            sections.map((section, index) => (
+              <div key={section.id} className="report-section-card break-inside-avoid rounded-xl border border-slate-200 p-5 bg-white overflow-visible">
+                <div className="flex items-start justify-between gap-4 mb-3 no-print">
+                  <div className="flex-1">
+                    <input
+                      className="w-full text-lg font-black text-slate-900 border-b border-transparent hover:border-slate-200 focus:border-blue-300 outline-none"
+                      value={section.section_title || ''}
+                      onChange={(e) => updateSectionContent(section.id, { section_title: e.target.value })}
+                    />
+                    <p className="text-[10px] uppercase tracking-widest font-black text-slate-400 mt-1">{section.section_type} · {section.source_type || 'manual'}</p>
+                  </div>
+                  <div className="flex gap-1">
+                    <button onClick={() => moveSection(section.id, -1)} disabled={index === 0} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-30"><ChevronUp className="w-4 h-4" /></button>
+                    <button onClick={() => moveSection(section.id, 1)} disabled={index === sections.length - 1} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-30"><ChevronDown className="w-4 h-4" /></button>
+                    <button onClick={() => deleteSection(section.id)} className="p-2 rounded bg-red-50 text-red-600 hover:bg-red-100"><Trash2 className="w-4 h-4" /></button>
+                  </div>
+                </div>
+
+                <div className="mb-3">
+                  <h2 className="text-lg font-black text-slate-900">{section.section_title}</h2>
+                  <p className="hidden print:block text-[10px] uppercase tracking-widest font-black text-slate-400 mt-1">{section.section_type} · {section.source_type || 'manual'}</p>
+                </div>
+
+                {renderReportSectionContent(section)}
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+
 const App = () => {
   const [authSession, setAuthSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -965,6 +1647,8 @@ const App = () => {
   const [selectedRosterId, setSelectedRosterId] = useState(() => localStorage.getItem('sc_selectedRosterId') || '');
   const [saveStatus, setSaveStatus] = useState('');
   const [expandedReportId, setExpandedReportId] = useState(null);
+  const [activeCustomReportId, setActiveCustomReportId] = useState('');
+  const [reportAddStatus, setReportAddStatus] = useState('');
   
   const [riderData, setRiderData] = useState(() => {
     const saved = localStorage.getItem('sc_currentRiderDraft');
@@ -1014,6 +1698,8 @@ const App = () => {
   const [durabilityMetrics, setDurabilityMetrics] = useState({ wkg: 4.1, decay: -3.2, status: 'Resilient' });
   const [isSavingToDatabase, setIsSavingToDatabase] = useState(false);
   const [databaseSaveStatus, setDatabaseSaveStatus] = useState('');
+  const [isRecalibratingZones, setIsRecalibratingZones] = useState(false);
+  const [recalibrationStatus, setRecalibrationStatus] = useState('');
   const [analysisBlockStart, setAnalysisBlockStart] = useState('');
   const [analysisBlockEnd, setAnalysisBlockEnd] = useState('');
   const [analysisBlockType, setAnalysisBlockType] = useState('');
@@ -1024,6 +1710,8 @@ const App = () => {
   const [selectedRideZoomRange, setSelectedRideZoomRange] = useState(null);
   const [selectedRideZoomStart, setSelectedRideZoomStart] = useState(null);
   const [selectedRideZoomEnd, setSelectedRideZoomEnd] = useState(null);
+  const [selectedSegmentIndex, setSelectedSegmentIndex] = useState(null);
+  const [isSegmentTableOpen, setIsSegmentTableOpen] = useState(false);
   const [isLoadingBlock, setIsLoadingBlock] = useState(false);
   const [isSavingBlock, setIsSavingBlock] = useState(false);
   const blockTypeOptions = ["VO2", "Tempo", "Recovery", "Zone 2", "Endurance", "Threshold", "Race Prep", "Custom"];
@@ -1150,6 +1838,7 @@ const App = () => {
     setWhoopStatus('idle');
     setClosingStatement("");
     setSelectedBlockRide(null);
+    setSelectedSegmentIndex(null);
     setChatMessages([
       { role: 'assistant', content: "Hey, Andrew here. I've got your latest block data loaded up alongside the Sans Chaine knowledge base. Let me know what you want to dig into." }
     ]);
@@ -1186,7 +1875,7 @@ const App = () => {
     }));
   };
 
-  const convertDbRideToAppRide = (ride, samples = []) => {
+  const convertDbRideToAppRide = (ride, samples = [], segments = []) => {
     const chartData = (samples || [])
       .sort((a, b) => (a.sample_index || 0) - (b.sample_index || 0))
       .map(sample => ({
@@ -1219,6 +1908,16 @@ const App = () => {
       name: ride.name || `Ride on ${ride.ride_date}`,
       tss: ride.tss ? Math.round(Number(ride.tss)) : 0,
       decoupling: ride.decoupling ? Number(ride.decoupling) : 0,
+      completionScore: ride.completion_score !== null && ride.completion_score !== undefined ? Math.round(Number(ride.completion_score)) : null,
+      effectivenessScore: ride.effectiveness_score !== null && ride.effectiveness_score !== undefined ? Math.round(Number(ride.effectiveness_score)) : null,
+      executionScore: ride.execution_score !== null && ride.execution_score !== undefined ? Math.round(Number(ride.execution_score)) : null,
+      executionSummary: ride.execution_summary || '',
+      powerAccuracyScore: ride.power_accuracy_score !== null && ride.power_accuracy_score !== undefined ? Math.round(Number(ride.power_accuracy_score)) : null,
+      hrResponseScore: ride.hr_response_score !== null && ride.hr_response_score !== undefined ? Math.round(Number(ride.hr_response_score)) : null,
+      recoveryQualityScore: ride.recovery_quality_score !== null && ride.recovery_quality_score !== undefined ? Math.round(Number(ride.recovery_quality_score)) : null,
+      repeatabilityScore: ride.repeatability_score !== null && ride.repeatability_score !== undefined ? Math.round(Number(ride.repeatability_score)) : null,
+      cadenceControlScore: ride.cadence_control_score !== null && ride.cadence_control_score !== undefined ? Math.round(Number(ride.cadence_control_score)) : null,
+      executionBreakdown: ride.execution_breakdown || null,
       chartData,
       sampleData: chartData.map((point, pointIndex) => ({
         sample_index: pointIndex,
@@ -1227,7 +1926,8 @@ const App = () => {
         heart_rate: Number(point.hr) || null,
         cadence: Number(point.cadence) || null,
         target_power: Number(point.target) || null
-      }))
+      })),
+      segments: (segments || []).sort((a, b) => (Number(a.segment_index) || 0) - (Number(b.segment_index) || 0))
     };
   };
 
@@ -1344,7 +2044,9 @@ const App = () => {
 
       const rideIds = (dbRides || []).map(ride => ride.id);
       const samplesByRideId = await fetchRideSamplesByRideIds(rideIds);
+      const segmentsByRideId = await fetchRideSegmentsByRideIds(rideIds);
       console.log('Loaded ride sample counts:', Object.fromEntries(Object.entries(samplesByRideId).map(([id, samples]) => [id, samples.length])));
+      console.log('Loaded ride segment counts:', Object.fromEntries(Object.entries(segmentsByRideId).map(([id, segments]) => [id, segments.length])));
 
       const { data: dbWhoopMetrics, error: whoopMetricsError } = await supabase
         .from('whoop_metrics')
@@ -1369,7 +2071,7 @@ const App = () => {
         return acc;
       }, {});
 
-      const loadedRides = (dbRides || []).map(ride => convertDbRideToAppRide(ride, samplesByRideId[ride.id] || []));
+      const loadedRides = (dbRides || []).map(ride => convertDbRideToAppRide(ride, samplesByRideId[ride.id] || [], segmentsByRideId[ride.id] || []));
       const startDate = loadedRides[0]?.date || athlete.startingDate || '2026-03-16';
       const endDate = loadedRides[loadedRides.length - 1]?.date || athlete.endDate || startDate;
 
@@ -1438,7 +2140,9 @@ const App = () => {
 
       const rideIds = (dbRides || []).map(ride => ride.id);
       const samplesByRideId = await fetchRideSamplesByRideIds(rideIds);
+      const segmentsByRideId = await fetchRideSegmentsByRideIds(rideIds);
       console.log('Loaded ride sample counts:', Object.fromEntries(Object.entries(samplesByRideId).map(([id, samples]) => [id, samples.length])));
+      console.log('Loaded ride segment counts:', Object.fromEntries(Object.entries(segmentsByRideId).map(([id, segments]) => [id, segments.length])));
 
       const { data: dbWhoopMetrics, error: whoopMetricsError } = await supabase
         .from('whoop_metrics')
@@ -1465,7 +2169,7 @@ const App = () => {
         return acc;
       }, {});
 
-      const loadedRides = (dbRides || []).map(ride => convertDbRideToAppRide(ride, samplesByRideId[ride.id] || []));
+      const loadedRides = (dbRides || []).map(ride => convertDbRideToAppRide(ride, samplesByRideId[ride.id] || [], segmentsByRideId[ride.id] || []));
 
       setRawRides(loadedRides);
       setSelectedBlockRide(loadedRides[0] || null);
@@ -1675,6 +2379,99 @@ const App = () => {
     }
   };
 
+  const ensureActiveCustomReport = async () => {
+    if (!supabase) throw new Error('Supabase is not configured.');
+    if (!riderData.supabaseId) throw new Error('Select or save a rider before adding to a report.');
+
+    if (activeCustomReportId) return activeCustomReportId;
+
+    const { data: latestReport, error: latestError } = await supabase
+      .from('custom_reports')
+      .select('*')
+      .eq('rider_id', riderData.supabaseId)
+      .order('updated_at', { ascending: false })
+      .limit(1);
+
+    if (latestError) throw latestError;
+
+    if (latestReport && latestReport.length > 0) {
+      setActiveCustomReportId(latestReport[0].id);
+      return latestReport[0].id;
+    }
+
+    const { data: newReport, error: createError } = await supabase
+      .from('custom_reports')
+      .insert({
+        rider_id: riderData.supabaseId,
+        report_title: `${riderData.name || 'Rider'} Custom Report ${new Date().toISOString().slice(0, 10)}`,
+        report_type: 'custom',
+        start_date: analysisBlockStart || riderData.startingDate || null,
+        end_date: analysisBlockEnd || riderData.endDate || null,
+        created_by: authSession?.user?.id || null,
+        updated_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (createError) throw createError;
+    setActiveCustomReportId(newReport.id);
+    return newReport.id;
+  };
+
+  const addSectionToActiveReport = async ({ sectionType = 'text', sectionTitle, content = '', chartConfig = null, sourceType = 'manual', sourceId = null }) => {
+    try {
+      const reportId = await ensureActiveCustomReport();
+
+      const { count, error: countError } = await supabase
+        .from('custom_report_sections')
+        .select('id', { count: 'exact', head: true })
+        .eq('report_id', reportId);
+
+      if (countError) throw countError;
+
+      const { error } = await supabase
+        .from('custom_report_sections')
+        .insert({
+          report_id: reportId,
+          section_order: (count || 0) + 1,
+          section_type: sectionType,
+          section_title: sectionTitle || 'Report Section',
+          content: content || '',
+          chart_config: chartConfig,
+          source_type: sourceType,
+          source_id: sourceId,
+          updated_at: new Date().toISOString()
+        });
+
+      if (error) throw error;
+
+      await supabase
+        .from('custom_reports')
+        .update({ updated_at: new Date().toISOString() })
+        .eq('id', reportId);
+
+      setReportAddStatus(`Added to report: ${sectionTitle || 'Section'}`);
+      setTimeout(() => setReportAddStatus(''), 2500);
+      return reportId;
+    } catch (error) {
+      console.error('Add to report failed:', JSON.stringify(error, null, 2));
+      alert(`Add to report failed: ${error.message}`);
+      return null;
+    }
+  };
+
+  const addChatInsightToReport = async (content) => {
+    if (!content) return;
+    await addSectionToActiveReport({
+      sectionType: 'chat_insight',
+      sectionTitle: 'Chatbot Coaching Insight',
+      content,
+      sourceType: 'chat',
+      sourceId: `chat-${Date.now()}`
+    });
+  };
+
+
   const saveCurrentImportToDatabase = async () => {
     if (!supabase) {
       alert('Supabase is not configured. Check your VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY values.');
@@ -1708,7 +2505,39 @@ const App = () => {
         if (!confirmedRider) riderId = null;
       }
 
-      if (!riderId) {
+      const handleAddLongTermChartToReport = async () => {
+    if (!onAddToReport) return;
+    await onAddToReport({
+      sectionType: 'chart',
+      sectionTitle: 'Long-Term Trend Chart',
+      content: `Long-Term chart for ${riderName || 'this rider'} with ${displayedChartData.length} visible data points.`,
+      chartConfig: {
+        chartType: hasTwoBlockComparison ? 'block_comparison' : 'long_term_trend',
+        chartTitle: hasTwoBlockComparison ? 'Block Comparison Chart' : 'Long-Term Trend Chart',
+        description: activeRange ? `${activeRange.start} to ${activeRange.end}` : 'All visible rides',
+        activeRange,
+        compareBlockAId,
+        compareBlockBId,
+        metrics: ['TSS', 'NP', 'Avg HR', 'Decoupling', 'WHOOP Recovery', 'Sleep'],
+        dataPreview: displayedChartData.slice(0, 200)
+      },
+      sourceType: 'long_term',
+      sourceId: `${riderId}-${activeRange?.start || 'all'}-${activeRange?.end || 'all'}`
+    });
+  };
+
+  const handleAddLongTermInsightToReport = async () => {
+    if (!onAddToReport || !longTermAnalysis) return;
+    await onAddToReport({
+      sectionType: 'ai_insight',
+      sectionTitle: 'Long-Term AI Coach Insight',
+      content: longTermAnalysis,
+      sourceType: 'long_term_ai',
+      sourceId: `${riderId}-${Date.now()}`
+    });
+  };
+
+  if (!riderId) {
         const { data: existingRiders, error: findError } = await supabase
           .from('riders')
           .select('*')
@@ -1784,7 +2613,17 @@ const App = () => {
           wkg: Number(ride.wkg) || null,
           sync_method: ride.syncMethod || null,
           source: 'fit_import',
-          raw_summary: ride.summary || null
+          raw_summary: ride.summary || null,
+          completion_score: ride.completionScore !== null && ride.completionScore !== undefined ? Number(ride.completionScore) : null,
+          effectiveness_score: ride.effectivenessScore !== null && ride.effectivenessScore !== undefined ? Number(ride.effectivenessScore) : null,
+          execution_score: ride.executionScore !== null && ride.executionScore !== undefined ? Number(ride.executionScore) : null,
+          execution_summary: ride.executionSummary || null,
+          power_accuracy_score: ride.powerAccuracyScore !== null && ride.powerAccuracyScore !== undefined ? Number(ride.powerAccuracyScore) : null,
+          hr_response_score: ride.hrResponseScore !== null && ride.hrResponseScore !== undefined ? Number(ride.hrResponseScore) : null,
+          recovery_quality_score: ride.recoveryQualityScore !== null && ride.recoveryQualityScore !== undefined ? Number(ride.recoveryQualityScore) : null,
+          repeatability_score: ride.repeatabilityScore !== null && ride.repeatabilityScore !== undefined ? Number(ride.repeatabilityScore) : null,
+          cadence_control_score: ride.cadenceControlScore !== null && ride.cadenceControlScore !== undefined ? Number(ride.cadenceControlScore) : null,
+          execution_breakdown: ride.executionBreakdown || null
         };
       });
 
@@ -1796,7 +2635,8 @@ const App = () => {
         variability_index: r.variability_index,
         avg_cadence: r.avg_cadence,
         max_power: r.max_power,
-        max_hr: r.max_hr
+        max_hr: r.max_hr,
+        execution_score: r.execution_score
       })));
 
       const { data: savedRides, error: ridesError } = await supabase
@@ -1809,6 +2649,7 @@ const App = () => {
       const savedRideByKey = new Map((savedRides || []).map(ride => [ride.dedupe_key, ride]));
       const savedRideIds = (savedRides || []).map(ride => ride.id).filter(Boolean);
       const sampleRows = [];
+      const segmentRows = [];
 
       rawRides.forEach((originalRide, rideIndex) => {
         const dedupeKey = buildRideDedupeKey(originalRide);
@@ -1860,6 +2701,38 @@ const App = () => {
             target_power: Number(point.target_power) || null
           });
         });
+
+        (originalRide?.segments || []).forEach(segment => {
+          segmentRows.push({
+            ride_id: savedRide.id,
+            rider_id: riderId,
+            segment_index: segment.segment_index,
+            source: segment.source || 'fit_lap',
+            segment_type: segment.segment_type,
+            start_seconds: segment.start_seconds,
+            end_seconds: segment.end_seconds,
+            duration_seconds: segment.duration_seconds,
+            target_power_low: segment.target_power_low,
+            target_power_high: segment.target_power_high,
+            target_power_zone: segment.target_power_zone,
+            target_hr_low: segment.target_hr_low,
+            target_hr_high: segment.target_hr_high,
+            target_hr_zone: segment.target_hr_zone,
+            avg_power: segment.avg_power,
+            max_power: segment.max_power,
+            avg_hr: segment.avg_hr,
+            max_hr: segment.max_hr,
+            avg_cadence: segment.avg_cadence,
+            power_result: segment.power_result,
+            hr_result: segment.hr_result,
+            segment_score: segment.segment_score,
+            power_score: segment.power_score,
+            hr_score: segment.hr_score,
+            recovery_score: segment.recovery_score,
+            repeatability_flag: segment.repeatability_flag,
+            coaching_note: segment.coaching_note
+          });
+        });
       });
 
       if (savedRideIds.length > 0) {
@@ -1869,6 +2742,13 @@ const App = () => {
           .in('ride_id', savedRideIds);
 
         if (deleteSamplesError) throw deleteSamplesError;
+
+        const { error: deleteSegmentsError } = await supabase
+          .from('ride_segments')
+          .delete()
+          .in('ride_id', savedRideIds);
+
+        if (deleteSegmentsError) throw deleteSegmentsError;
       }
 
       if (sampleRows.length > 0) {
@@ -1880,6 +2760,18 @@ const App = () => {
             .insert(batch);
 
           if (samplesError) throw samplesError;
+        }
+      }
+
+      if (segmentRows.length > 0) {
+        const batchSize = 500;
+        for (let i = 0; i < segmentRows.length; i += batchSize) {
+          const batch = segmentRows.slice(i, i + batchSize);
+          const { error: segmentsError } = await supabase
+            .from('ride_segments')
+            .insert(batch);
+
+          if (segmentsError) throw segmentsError;
         }
       }
 
@@ -1907,12 +2799,12 @@ const App = () => {
         if (whoopError) throw whoopError;
       }
 
-      setDatabaseSaveStatus(`Saved or updated ${rideRows.length} rides, ${sampleRows.length} chart sample points, and ${whoopRows.length} WHOOP metric days to database.`);
+      setDatabaseSaveStatus(`Saved or updated ${rideRows.length} rides, ${sampleRows.length} chart sample points, ${segmentRows.length} ride segments, and ${whoopRows.length} WHOOP metric days to database.`);
 
       // Reload from Supabase immediately so Block Analysis uses database-backed rides and charts.
       await loadRiderDataFromSupabase({ ...riderData, name: riderData.name });
 
-      alert(`Saved or updated ${rideRows.length} rides, ${sampleRows.length} chart sample points, and ${whoopRows.length} WHOOP metric days to Supabase.`);
+      alert(`Saved or updated ${rideRows.length} rides, ${sampleRows.length} chart sample points, ${segmentRows.length} ride segments, and ${whoopRows.length} WHOOP metric days to Supabase.`);
     } catch (error) {
       console.error('Database save failed:', JSON.stringify(error, null, 2));
       setDatabaseSaveStatus(`Database save failed: ${error.message}`);
@@ -2015,6 +2907,631 @@ const App = () => {
 
 
   // --- Agent & Telemetry Logic ---
+
+  const getPowerZoneRange = (zoneName, zones) => {
+    const z = zones || {};
+    switch (zoneName) {
+      case "Recovery": return [Number(z.pwr_rec_low) || 0, Number(z.pwr_rec_high) || null];
+      case "Endurance": return [Number(z.pwr_rec_high) || null, Number(z.pwr_end_high) || null];
+      case "Tempo Z2": return [Number(z.pwr_end_high) || null, Number(z.pwr_tem_Z2) || null];
+      case "Tempo High": return [Number(z.pwr_tem_Z2) || null, Number(z.pwr_tem_high) || null];
+      case "Sweet Spot": return [Number(z.pwr_tem_high) || null, Number(z.pwr_SS_high) || null];
+      case "Threshold": return [Number(z.pwr_SS_high) || null, Number(z.pwr_thr_high) || null];
+      case "VO2 Max": return [Number(z.pwr_thr_high) || null, Number(z.pwr_vo2_high) || null];
+      case "Anaerobic": return [Number(z.pwr_vo2_high) || null, null];
+      default: return [null, null];
+    }
+  };
+
+  const getHrZoneRange = (zoneName, zones) => {
+    const z = zones || {};
+    switch (zoneName) {
+      case "Recovery": return [Number(z.hr_rec_low) || 0, Number(z.hr_rec_high) || null];
+      case "Endurance": return [Number(z.hr_rec_high) || null, Number(z.hr_end_high) || null];
+      case "HR Z2": return [Number(z.hr_end_high) || null, Number(z.hr_z2_high) || null];
+      case "Tempo": return [Number(z.hr_z2_high) || null, Number(z.hr_tem_high) || null];
+      case "Threshold": return [Number(z.hr_tem_high) || null, Number(z.hr_thr_high) || null];
+      case "VO2 Max": return [Number(z.hr_thr_high) || null, Number(z.hr_vo2_high) || null];
+      case "VO2 Anaerobic": return [Number(z.hr_vo2_high) || null, Number(z.hr_vo2_anarc) || null];
+      case "Max Effort": return [Number(z.hr_vo2_anarc) || null, null];
+      default: return [null, null];
+    }
+  };
+
+  const classifyRangeResult = (actual, low, high) => {
+    const value = Number(actual);
+    if (!value || low === null || low === undefined) return "unknown";
+    if (value < low) return "below";
+    if (high !== null && high !== undefined && value > high) return "above";
+    return "in_range";
+  };
+
+  const inferSegmentType = ({ durationSeconds, powerZone, avgPower, segmentIndex, totalSegments }) => {
+    const duration = Number(durationSeconds) || 0;
+    if (!avgPower || avgPower <= 0) return "unknown";
+    if (segmentIndex === 1 && duration >= 300 && ["Recovery", "Endurance", "Tempo Z2", "Below Zone"].includes(powerZone)) return "warmup";
+    if (segmentIndex === totalSegments && duration >= 300 && ["Recovery", "Endurance", "Tempo Z2", "Below Zone"].includes(powerZone)) return "cooldown";
+    if (duration <= 30 && ["VO2 Max", "Anaerobic"].includes(powerZone)) return "sprint";
+    if (powerZone === "Anaerobic") return "anaerobic";
+    if (powerZone === "VO2 Max") return "vo2";
+    if (powerZone === "Threshold") return "threshold";
+    if (["Sweet Spot", "Tempo High"].includes(powerZone)) return "tempo";
+    if (["Tempo Z2", "Endurance"].includes(powerZone)) return "endurance";
+    if (["Recovery", "Below Zone"].includes(powerZone)) return "recovery";
+    return "unknown";
+  };
+
+  const getExpectedHrZoneForSegment = (segmentType, durationSeconds) => {
+    const duration = Number(durationSeconds) || 0;
+    if (["sprint", "anaerobic", "vo2"].includes(segmentType)) return "VO2 Max";
+    if (segmentType === "threshold") return "Threshold";
+    if (segmentType === "tempo") return "Tempo";
+    if (segmentType === "endurance" || segmentType === "warmup" || segmentType === "cooldown") return "Endurance";
+    if (segmentType === "recovery") return "Recovery";
+    return "Unknown";
+  };
+
+  const classifyHrResponse = ({ segmentType, durationSeconds, hrResult }) => {
+    const duration = Number(durationSeconds) || 0;
+    if (hrResult === "unknown") return "unknown";
+    if (["vo2", "anaerobic", "sprint"].includes(segmentType) && duration <= 120) return "lag_expected";
+    if (hrResult === "in_range") return "expected";
+    if (hrResult === "below") return "below_expected";
+    if (hrResult === "above") return "high_response";
+    return "unknown";
+  };
+
+  const buildSegmentCoachingNote = ({ segmentType, durationSeconds, powerZone, powerResult, hrResponse }) => {
+    const duration = Number(durationSeconds) || 0;
+    if (segmentType === "vo2" && powerResult === "in_range" && hrResponse === "lag_expected") return "Power landed in the rider's VO2 range. HR lag is expected for this short interval duration.";
+    if (segmentType === "recovery" && powerResult === "in_range") return "Recovery power dropped appropriately, giving the rider space to repeat the next effort.";
+    if (segmentType === "threshold" && powerResult === "in_range" && hrResponse === "expected") return "Threshold work appears controlled with HR response matching the effort.";
+    if (powerResult === "below") return `Power was below the expected ${powerZone} range for this segment.`;
+    if (powerResult === "above") return `Power was above the expected ${powerZone} range. This may indicate over-execution unless the effort was intended to be harder.`;
+    if (hrResponse === "high_response" && duration > 180) return "HR response was high relative to the target zone, which may indicate fatigue, heat, poor recovery, or accumulating drift.";
+    return "Segment classified from lap power, HR response, duration, and rider-specific zones.";
+  };
+
+
+  const clampScore = (value, min = 0, max = 100) => Math.max(min, Math.min(max, Math.round(Number(value) || 0)));
+
+  const scoreAgainstRange = (actual, low, high, { overPenalty = 150, underPenalty = 200 } = {}) => {
+    const value = Number(actual);
+    const min = Number(low);
+    const max = high === null || high === undefined ? null : Number(high);
+
+    if (!value || Number.isNaN(value) || !min || Number.isNaN(min)) return null;
+    if (value >= min && (max === null || value <= max)) return 100;
+
+    if (value < min) {
+      const gapPct = (min - value) / min;
+      return clampScore(100 - (gapPct * underPenalty));
+    }
+
+    if (max !== null && value > max) {
+      const gapPct = (value - max) / max;
+      return clampScore(100 - (gapPct * overPenalty));
+    }
+
+    return 80;
+  };
+
+  const scoreHrResponse = (hrResult) => {
+    switch (hrResult) {
+      case 'expected': return 95;
+      case 'lag_expected': return 90;
+      case 'below_expected': return 76;
+      case 'high_response': return 68;
+      case 'unknown':
+      default: return null;
+    }
+  };
+
+  const scoreSegmentExecution = (segment) => {
+    const powerScore = scoreAgainstRange(segment.avg_power, segment.target_power_low, segment.target_power_high);
+    const hrScore = scoreHrResponse(segment.hr_result);
+    const recoveryScore = segment.segment_type === 'recovery'
+      ? (powerScore !== null ? Math.min(100, powerScore + 5) : null)
+      : null;
+
+    let segmentScore;
+    if (segment.segment_type === 'recovery') {
+      segmentScore = Math.round(((recoveryScore ?? 75) * 0.75) + ((hrScore ?? 75) * 0.25));
+    } else if (['vo2', 'threshold', 'tempo', 'anaerobic', 'sprint'].includes(segment.segment_type)) {
+      segmentScore = Math.round(((powerScore ?? 70) * 0.8) + ((hrScore ?? 80) * 0.2));
+    } else {
+      segmentScore = Math.round(((powerScore ?? 75) * 0.65) + ((hrScore ?? 75) * 0.35));
+    }
+
+    return {
+      ...segment,
+      power_score: powerScore,
+      hr_score: hrScore,
+      recovery_score: recoveryScore,
+      segment_score: clampScore(segmentScore)
+    };
+  };
+
+  const calculateRepeatabilityScore = (segments = []) => {
+    const workSegments = segments.filter(s => ['vo2', 'threshold', 'tempo', 'anaerobic', 'sprint'].includes(s.segment_type) && Number(s.avg_power) > 0);
+    if (workSegments.length < 3) return { score: 85, flag: 'limited_reps' };
+
+    const repWindow = Math.min(2, Math.floor(workSegments.length / 2));
+    const first = workSegments.slice(0, repWindow);
+    const last = workSegments.slice(-repWindow);
+    const firstAvg = first.reduce((sum, s) => sum + Number(s.avg_power || 0), 0) / first.length;
+    const lastAvg = last.reduce((sum, s) => sum + Number(s.avg_power || 0), 0) / last.length;
+    const fadePct = firstAvg > 0 ? ((firstAvg - lastAvg) / firstAvg) * 100 : 0;
+
+    if (fadePct <= 3) return { score: 100, flag: 'excellent_repeatability' };
+    if (fadePct <= 6) return { score: 90, flag: 'acceptable_fade' };
+    if (fadePct <= 10) return { score: 75, flag: 'moderate_fade' };
+    if (fadePct <= 15) return { score: 60, flag: 'significant_fade' };
+    return { score: 45, flag: 'major_fade' };
+  };
+
+  const calculateCadenceControlScore = (segments = [], ride = {}) => {
+    const cadenceValues = segments
+      .map(s => Number(s.avg_cadence))
+      .filter(v => v > 0);
+
+    if (cadenceValues.length < 3) {
+      return Number(ride.avgCadence || ride.cadence) > 0 ? 85 : 80;
+    }
+
+    const avgCad = cadenceValues.reduce((sum, v) => sum + v, 0) / cadenceValues.length;
+    const variance = cadenceValues.reduce((sum, v) => sum + Math.pow(v - avgCad, 2), 0) / cadenceValues.length;
+    const stdDev = Math.sqrt(variance);
+    const cv = avgCad > 0 ? (stdDev / avgCad) * 100 : 0;
+
+    if (cv <= 8) return 100;
+    if (cv <= 12) return 90;
+    if (cv <= 18) return 75;
+    if (cv <= 25) return 62;
+    return 50;
+  };
+
+  const buildPillar = ({ label, points, max, score, summary }) => ({
+    label,
+    points: Number(Number(points || 0).toFixed(1)),
+    max,
+    score: score !== null && score !== undefined ? clampScore(score) : null,
+    summary
+  });
+
+  const calculateRideExecutionScores = (segments = [], ride = {}) => {
+    if (!segments || segments.length === 0) {
+      return {
+        completionScore: null,
+        effectivenessScore: null,
+        executionScore: null,
+        powerAccuracyScore: null,
+        hrResponseScore: null,
+        recoveryQualityScore: null,
+        repeatabilityScore: null,
+        cadenceControlScore: null,
+        executionBreakdown: null,
+        executionSummary: 'No lap or segment structure was detected for this ride.',
+        segments: []
+      };
+    }
+
+    const scoredSegments = segments.map(scoreSegmentExecution);
+    const validSegments = scoredSegments.filter(s => Number(s.duration_seconds) >= 5);
+    const workSegments = validSegments.filter(s => ['vo2', 'threshold', 'tempo', 'anaerobic', 'sprint'].includes(s.segment_type));
+    const recoverySegments = validSegments.filter(s => s.segment_type === 'recovery');
+    const powerScores = validSegments.map(s => s.power_score).filter(v => v !== null && v !== undefined);
+    const hrScores = validSegments.map(s => s.hr_score).filter(v => v !== null && v !== undefined);
+    const recoveryScores = recoverySegments.map(s => s.recovery_score).filter(v => v !== null && v !== undefined);
+
+    const avg = arr => arr.length ? arr.reduce((sum, v) => sum + Number(v || 0), 0) / arr.length : null;
+    const inRangeCount = validSegments.filter(s => s.power_result === 'in_range').length;
+    const belowCount = validSegments.filter(s => s.power_result === 'below').length;
+    const aboveCount = validSegments.filter(s => s.power_result === 'above').length;
+    const highHrCount = validSegments.filter(s => s.hr_result === 'high_response').length;
+    const lowHrCount = validSegments.filter(s => s.hr_result === 'below_expected').length;
+    const lagHrCount = validSegments.filter(s => s.hr_result === 'lag_expected').length;
+
+    // Pillar model: 100 max points.
+    // Completion 20, Power 35, HR 15, Recovery 15, Repeatability 10, Cadence/Control 5.
+    const completionPct = validSegments.length > 0 ? 100 : 0;
+    const completionPoints = validSegments.length > 0 ? 20 : 0;
+
+    const powerAccuracyScore = avg(powerScores) ?? 75;
+    const powerAccuracyPoints = (powerAccuracyScore / 100) * 35;
+
+    const hrResponseScore = avg(hrScores) ?? 80;
+    const hrResponsePoints = (hrResponseScore / 100) * 15;
+
+    const recoveryQualityScore = recoveryScores.length ? avg(recoveryScores) : 85;
+    const recoveryQualityPoints = (recoveryQualityScore / 100) * 15;
+
+    const repeatability = calculateRepeatabilityScore(validSegments);
+    const repeatabilityPoints = (repeatability.score / 100) * 10;
+
+    const cadenceControlScore = calculateCadenceControlScore(validSegments, ride);
+    const cadenceControlPoints = (cadenceControlScore / 100) * 5;
+
+    const executionScore = clampScore(
+      completionPoints +
+      powerAccuracyPoints +
+      hrResponsePoints +
+      recoveryQualityPoints +
+      repeatabilityPoints +
+      cadenceControlPoints
+    );
+
+    const effectivenessScore = clampScore(((executionScore - completionPoints) / 80) * 100);
+    const completionScore = clampScore(completionPct);
+
+    const completionPillar = buildPillar({
+      label: 'Completion',
+      points: completionPoints,
+      max: 20,
+      score: completionScore,
+      summary: validSegments.length ? `${validSegments.length}/${validSegments.length} detected segment(s) completed.` : 'No meaningful segments detected.'
+    });
+
+    const powerPillar = buildPillar({
+      label: 'Power Accuracy',
+      points: powerAccuracyPoints,
+      max: 35,
+      score: powerAccuracyScore,
+      summary: `${inRangeCount}/${validSegments.length} segment(s) in rider-specific power range.${belowCount ? ` ${belowCount} below target.` : ''}${aboveCount ? ` ${aboveCount} above target.` : ''}`
+    });
+
+    const hrPillar = buildPillar({
+      label: 'HR Response',
+      points: hrResponsePoints,
+      max: 15,
+      score: hrResponseScore,
+      summary: `${highHrCount} high response, ${lowHrCount} below expected, ${lagHrCount} expected HR lag segment(s).`
+    });
+
+    const recoveryPillar = buildPillar({
+      label: 'Recovery Quality',
+      points: recoveryQualityPoints,
+      max: 15,
+      score: recoveryQualityScore,
+      summary: recoverySegments.length ? `${recoverySegments.length} recovery segment(s) scored for recovery discipline.` : 'No recovery segments detected; neutral score applied.'
+    });
+
+    const repeatabilityPillar = buildPillar({
+      label: 'Repeatability / Fade',
+      points: repeatabilityPoints,
+      max: 10,
+      score: repeatability.score,
+      summary: repeatability.flag.replace(/_/g, ' ')
+    });
+
+    const cadencePillar = buildPillar({
+      label: 'Cadence / Control',
+      points: cadenceControlPoints,
+      max: 5,
+      score: cadenceControlScore,
+      summary: cadenceControlScore >= 90 ? 'Cadence/control was stable.' : cadenceControlScore >= 75 ? 'Cadence/control was acceptable.' : 'Cadence/control was variable.'
+    });
+
+    const pillars = [completionPillar, powerPillar, hrPillar, recoveryPillar, repeatabilityPillar, cadencePillar];
+    const limitingPillar = pillars
+      .filter(p => p.score !== null && p.max > 0)
+      .sort((a, b) => (a.points / a.max) - (b.points / b.max))[0];
+
+    const executionSummary = validSegments.length
+      ? `${executionScore}/100 execution. Strongest signal: ${powerPillar.summary} Limiter: ${limitingPillar?.label || 'N/A'} — ${limitingPillar?.summary || 'No limiter identified.'}`
+      : 'No meaningful workout segments were available to score.';
+
+    const segmentsWithRepeatability = scoredSegments.map(segment => ({
+      ...segment,
+      repeatability_flag: ['vo2', 'threshold', 'tempo', 'anaerobic', 'sprint'].includes(segment.segment_type) ? repeatability.flag : null
+    }));
+
+    return {
+      completionScore,
+      effectivenessScore,
+      executionScore,
+      powerAccuracyScore: clampScore(powerAccuracyScore),
+      hrResponseScore: clampScore(hrResponseScore),
+      recoveryQualityScore: clampScore(recoveryQualityScore),
+      repeatabilityScore: clampScore(repeatability.score),
+      cadenceControlScore: clampScore(cadenceControlScore),
+      executionBreakdown: {
+        total: { points: executionScore, max: 100 },
+        pillars,
+        limitingPillar: limitingPillar?.label || null,
+        workSegments: workSegments.length,
+        recoverySegments: recoverySegments.length,
+        inRangeCount,
+        belowCount,
+        aboveCount,
+        highHrCount,
+        lowHrCount,
+        lagHrCount
+      },
+      executionSummary,
+      segments: segmentsWithRepeatability
+    };
+  };
+
+
+  const recalibrateSegmentToCurrentZones = (segment, riderZones, segmentIndex = 1, totalSegments = 1) => {
+    const durationSeconds = Number(segment.duration_seconds) || 0;
+    const avgPower = Number(segment.avg_power) || 0;
+    const avgHr = Number(segment.avg_hr) || 0;
+
+    const powerZone = avgPower > 0 ? getPowerZone(avgPower, riderZones) : "Unknown";
+    const segmentType = inferSegmentType({
+      durationSeconds,
+      powerZone,
+      avgPower,
+      segmentIndex,
+      totalSegments
+    });
+
+    const expectedHrZone = getExpectedHrZoneForSegment(segmentType, durationSeconds);
+    const [targetPowerLow, targetPowerHigh] = getPowerZoneRange(powerZone, riderZones);
+    const [targetHrLow, targetHrHigh] = getHrZoneRange(expectedHrZone, riderZones);
+
+    const powerResult = classifyRangeResult(avgPower, targetPowerLow, targetPowerHigh);
+    const rawHrResult = classifyRangeResult(avgHr, targetHrLow, targetHrHigh);
+    const hrResult = classifyHrResponse({
+      segmentType,
+      durationSeconds,
+      hrResult: rawHrResult
+    });
+
+    const coachingNote = buildSegmentCoachingNote({
+      segmentType,
+      durationSeconds,
+      powerZone,
+      powerResult,
+      hrResponse: hrResult
+    });
+
+    return scoreSegmentExecution({
+      ...segment,
+      segment_type: segmentType,
+      target_power_zone: powerZone,
+      target_power_low: targetPowerLow,
+      target_power_high: targetPowerHigh,
+      target_hr_zone: expectedHrZone,
+      target_hr_low: targetHrLow,
+      target_hr_high: targetHrHigh,
+      power_result: powerResult,
+      hr_result: hrResult,
+      coaching_note: coachingNote
+    });
+  };
+
+  const handleRecalibrateRiderZones = async () => {
+    if (!supabase) {
+      alert('Supabase is not configured.');
+      return;
+    }
+
+    if (!riderData?.supabaseId) {
+      alert('Select and save a rider before recalibrating ride scores.');
+      return;
+    }
+
+    const confirmed = window.confirm(
+      'Recalculate segment zones and workout execution scores for this rider using the current rider profile zones? This does not delete or reimport ride files.'
+    );
+    if (!confirmed) return;
+
+    setIsRecalibratingZones(true);
+    setRecalibrationStatus('Loading existing rides and segments...');
+
+    try {
+      const { data: dbRides, error: ridesError } = await supabase
+        .from('rides')
+        .select('*')
+        .eq('rider_id', riderData.supabaseId)
+        .order('ride_date', { ascending: true });
+
+      if (ridesError) throw ridesError;
+
+      if (!dbRides || dbRides.length === 0) {
+        setRecalibrationStatus('No rides found for this rider.');
+        setIsRecalibratingZones(false);
+        return;
+      }
+
+      const rideIds = dbRides.map(ride => ride.id);
+      const { data: dbSegments, error: segmentsError } = await supabase
+        .from('ride_segments')
+        .select('*')
+        .in('ride_id', rideIds)
+        .order('segment_index', { ascending: true });
+
+      if (segmentsError) throw segmentsError;
+
+      const segmentsByRideId = (dbSegments || []).reduce((acc, segment) => {
+        if (!acc[segment.ride_id]) acc[segment.ride_id] = [];
+        acc[segment.ride_id].push(segment);
+        return acc;
+      }, {});
+
+      const segmentUpdateRows = [];
+      const rideUpdateRows = [];
+
+      dbRides.forEach(ride => {
+        const originalSegments = segmentsByRideId[ride.id] || [];
+        if (originalSegments.length === 0) {
+          rideUpdateRows.push({
+            id: ride.id,
+            completion_score: null,
+            effectiveness_score: null,
+            execution_score: null,
+            power_accuracy_score: null,
+            hr_response_score: null,
+            recovery_quality_score: null,
+            repeatability_score: null,
+            cadence_control_score: null,
+            execution_breakdown: null,
+            execution_summary: 'No lap or segment structure was detected for this ride.'
+          });
+          return;
+        }
+
+        const totalSegments = originalSegments.length;
+        const recalibratedSegments = originalSegments.map((segment, index) =>
+          recalibrateSegmentToCurrentZones(segment, riderData.zones, index + 1, totalSegments)
+        );
+
+        const appRideForScoring = {
+          avgCadence: ride.avg_cadence,
+          cadence: ride.cadence
+        };
+        const rideScore = calculateRideExecutionScores(recalibratedSegments, appRideForScoring);
+
+        recalibratedSegments.forEach(segment => {
+          segmentUpdateRows.push({
+            id: segment.id,
+            segment_type: segment.segment_type,
+            target_power_low: segment.target_power_low,
+            target_power_high: segment.target_power_high,
+            target_power_zone: segment.target_power_zone,
+            target_hr_low: segment.target_hr_low,
+            target_hr_high: segment.target_hr_high,
+            target_hr_zone: segment.target_hr_zone,
+            power_result: segment.power_result,
+            hr_result: segment.hr_result,
+            coaching_note: segment.coaching_note,
+            segment_score: segment.segment_score,
+            power_score: segment.power_score,
+            hr_score: segment.hr_score,
+            recovery_score: segment.recovery_score,
+            repeatability_flag: segment.repeatability_flag || null
+          });
+        });
+
+        rideUpdateRows.push({
+          id: ride.id,
+          completion_score: rideScore.completionScore,
+          effectiveness_score: rideScore.effectivenessScore,
+          execution_score: rideScore.executionScore,
+          power_accuracy_score: rideScore.powerAccuracyScore,
+          hr_response_score: rideScore.hrResponseScore,
+          recovery_quality_score: rideScore.recoveryQualityScore,
+          repeatability_score: rideScore.repeatabilityScore,
+          cadence_control_score: rideScore.cadenceControlScore,
+          execution_breakdown: rideScore.executionBreakdown,
+          execution_summary: rideScore.executionSummary
+        });
+      });
+
+      setRecalibrationStatus(`Updating ${rideUpdateRows.length} rides and ${segmentUpdateRows.length} segments...`);
+
+      // Use targeted UPDATE statements rather than UPSERTs. UPSERT can try to insert
+      // partial rows when PostgREST cannot match/conflict the row, which fails on required
+      // fields such as rides.ride_date. These recalibration rows intentionally contain only
+      // derived score/zone fields, so updates are safer and preserve the original ride data.
+      const updateInChunks = async (rows, tableName, label) => {
+        const concurrency = 10;
+        for (let i = 0; i < rows.length; i += concurrency) {
+          const batch = rows.slice(i, i + concurrency);
+          const results = await Promise.all(batch.map(row => {
+            const { id, ...updates } = row;
+            return supabase
+              .from(tableName)
+              .update(updates)
+              .eq('id', id);
+          }));
+
+          const failed = results.find(result => result.error);
+          if (failed?.error) {
+            throw new Error(`${label} update failed: ${failed.error.message}`);
+          }
+        }
+      };
+
+      await updateInChunks(segmentUpdateRows, 'ride_segments', 'Segment recalibration');
+      await updateInChunks(rideUpdateRows, 'rides', 'Ride recalibration');
+
+      setRecalibrationStatus(`Recalibrated ${rideUpdateRows.length} rides using the current rider zones.`);
+
+      // Refresh the visible block if one is loaded so the scorecards update immediately.
+      if (analysisBlockStart && analysisBlockEnd) {
+        await loadBlockAnalysisFromDatabase();
+      } else {
+        const currentRider = athleteRoster.find(a => a.id === riderData.supabaseId) || { ...riderData, id: riderData.supabaseId };
+        await loadRiderDataFromSupabase(currentRider);
+      }
+
+      setTimeout(() => setRecalibrationStatus(''), 5000);
+    } catch (error) {
+      console.error('Zone recalibration failed:', JSON.stringify(error, null, 2));
+      setRecalibrationStatus('');
+      alert(`Zone recalibration failed: ${error.message}`);
+    } finally {
+      setIsRecalibratingZones(false);
+    }
+  };
+
+  const buildRideSegmentsFromFitLaps = (session, riderZones) => {
+    if (!session?.laps || session.laps.length === 0) return [];
+    const meaningfulLaps = session.laps.filter(lap => {
+      const duration = Number(lap.total_elapsed_time) || Number(lap.total_timer_time) || Number(lap.total_moving_time) || 0;
+      return duration >= 5;
+    });
+    if (meaningfulLaps.length < 2) return [];
+
+    let runningStart = 0;
+    return meaningfulLaps.map((lap, index) => {
+      const durationSeconds = Number(lap.total_elapsed_time) || Number(lap.total_timer_time) || Number(lap.total_moving_time) || 0;
+      const avgPower = Number(lap.avg_power) || Number(lap.average_power) || Number(lap.enhanced_avg_power) || 0;
+      const maxPower = Number(lap.max_power) || Number(lap.maximum_power) || Number(lap.enhanced_max_power) || 0;
+      const avgHr = Number(lap.avg_heart_rate) || Number(lap.average_heart_rate) || 0;
+      const maxHr = Number(lap.max_heart_rate) || Number(lap.maximum_heart_rate) || 0;
+      const avgCadence = Number(lap.avg_cadence) || Number(lap.average_cadence) || 0;
+      const powerZone = avgPower > 0 ? getPowerZone(avgPower, riderZones) : "Unknown";
+      const actualHrZone = avgHr > 0 ? getHRZone(avgHr, riderZones) : "Unknown";
+      const [targetPowerLow, targetPowerHigh] = getPowerZoneRange(powerZone, riderZones);
+      const segmentType = inferSegmentType({ durationSeconds, powerZone, avgPower, segmentIndex: index + 1, totalSegments: meaningfulLaps.length });
+      const expectedHrZone = getExpectedHrZoneForSegment(segmentType, durationSeconds);
+      const [targetHrLow, targetHrHigh] = getHrZoneRange(expectedHrZone, riderZones);
+      const powerResult = classifyRangeResult(avgPower, targetPowerLow, targetPowerHigh);
+      const rawHrResult = classifyRangeResult(avgHr, targetHrLow, targetHrHigh);
+      const hrResult = classifyHrResponse({ segmentType, durationSeconds, hrResult: rawHrResult });
+      const startSeconds = runningStart;
+      const endSeconds = runningStart + durationSeconds;
+      runningStart = endSeconds;
+      const coachingNote = buildSegmentCoachingNote({ segmentType, durationSeconds, powerZone, powerResult, hrResponse: hrResult });
+      const baseSegment = {
+        segment_index: index + 1,
+        source: "fit_lap",
+        segment_type: segmentType,
+        start_seconds: startSeconds,
+        end_seconds: endSeconds,
+        duration_seconds: durationSeconds,
+        target_power_low: targetPowerLow,
+        target_power_high: targetPowerHigh,
+        target_power_zone: powerZone,
+        target_hr_low: targetHrLow,
+        target_hr_high: targetHrHigh,
+        target_hr_zone: expectedHrZone,
+        avg_power: avgPower || null,
+        max_power: maxPower || null,
+        avg_hr: avgHr || null,
+        max_hr: maxHr || null,
+        avg_cadence: avgCadence || null,
+        power_result: powerResult,
+        hr_result: hrResult,
+        coaching_note: coachingNote
+      };
+
+      return scoreSegmentExecution(baseSegment);
+    });
+  };
+
+  const formatSegmentDuration = (seconds) => {
+    const total = Math.round(Number(seconds) || 0);
+    const mins = Math.floor(total / 60);
+    const secs = total % 60;
+    return `${mins}:${String(secs).padStart(2, '0')}`;
+  };
+
   const getPowerZone = (val, z) => {
     if (val < parseFloat(z.pwr_rec_low)) return "Below Zone";
     if (val <= parseFloat(z.pwr_rec_high)) return "Recovery";
@@ -2078,7 +3595,14 @@ const App = () => {
           
           if (day.rides.length > 0) {
             day.rides.forEach(r => {
-              logEntries.push(`- Date: ${r.date} | Activity: ${r.name} | TSS: ${r.tss} | NP: ${r.np || 'N/A'}W | VI: ${r.vi || 'N/A'} | Decoupling: ${r.decoupling}% | Avg Pwr: ${r.watts}W | Avg HR: ${r.hr}${recoveryStr} | Prescribed: ${r.summary}`);
+              const segmentSummary = r.segments?.length
+                ? ` | Segments: ${r.segments.map(s => `#${s.segment_index} ${s.segment_type} ${Math.round(Number(s.duration_seconds) || 0)}s, target ${s.target_power_zone || 'N/A'} (${s.target_power_low || 'N/A'}-${s.target_power_high || '+'}W), actual ${Math.round(Number(s.avg_power) || 0)}W, result ${s.power_result || 'unknown'}, HR ${Math.round(Number(s.avg_hr) || 0)} bpm (${s.hr_result || 'unknown'})`).join('; ')}`
+                : '';
+              const pillarStr = r.executionBreakdown?.pillars?.length
+                ? ` | Score Pillars: ${r.executionBreakdown.pillars.map(p => `${p.label} ${p.points}/${p.max} (${p.summary})`).join(' ; ')}`
+                : '';
+              const executionStr = r.executionScore ? ` | Execution Score: ${r.executionScore}/100 | Completion: ${r.completionScore || 'N/A'} | Effectiveness: ${r.effectivenessScore || 'N/A'} | Score Rationale: ${r.executionSummary || ''}${pillarStr}` : '';
+              logEntries.push(`- Date: ${r.date} | Activity: ${r.name} | TSS: ${r.tss} | NP: ${r.np || 'N/A'}W | VI: ${r.vi || 'N/A'} | Decoupling: ${r.decoupling}% | Avg Pwr: ${r.watts}W | Avg HR: ${r.hr}${recoveryStr}${executionStr} | Prescribed: ${r.summary}${segmentSummary}`);
             });
           } else {
             const reason = dayReasons[day.date] || "No Data / Unspecified";
@@ -2446,10 +3970,11 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
 
           const parser = new FitParser({ forceSetMessageName: false, mode: 'list' });
           const parsedData = await new Promise((resolve, reject) => { parser.parse(fileBuffer, (error, data) => { if (error) reject(error); else resolve(data); }); });
-          const records = parsedData.records || []; if (records.length === 0) continue;
+          const records = parsedData.records || []; const laps = parsedData.laps || []; if (records.length === 0) continue;
 
           let startTime = null; const baseFileName = fileName.split('/').pop();
-          if (!allSessions[baseFileName]) allSessions[baseFileName] = { id: baseFileName, dateFull: '', date: '', maxElapsed: 0, dataPoints: [] };
+          if (!allSessions[baseFileName]) allSessions[baseFileName] = { id: baseFileName, dateFull: '', date: '', maxElapsed: 0, dataPoints: [], laps: [] };
+          allSessions[baseFileName].laps = laps;
 
           for (const record of records) {
               const ts = record.timestamp; if (!ts) continue;
@@ -2509,6 +4034,8 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
           let calcTss = Math.round((durationHours * 3600 * Math.pow(ftp > 0 && np > 0 ? np / ftp : 0, 2)) / 36) || Math.round(durationHours * 60);
 
           const chartData = buildChartSamples(s.dataPoints, avgWatts);
+          const detectedSegments = buildRideSegmentsFromFitLaps(s, riderData.zones);
+          const rideExecution = calculateRideExecutionScores(detectedSegments, { durationHours, decoupling: decouplingCalc });
           
           return {
               id: s.id,
@@ -2531,6 +4058,16 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
               np: np || null,
               vi: vi,
               decoupling: parseFloat(decouplingCalc.toFixed(1)),
+              completionScore: rideExecution.completionScore,
+              effectivenessScore: rideExecution.effectivenessScore,
+              executionScore: rideExecution.executionScore,
+              executionSummary: rideExecution.executionSummary,
+              powerAccuracyScore: rideExecution.powerAccuracyScore,
+              hrResponseScore: rideExecution.hrResponseScore,
+              recoveryQualityScore: rideExecution.recoveryQualityScore,
+              repeatabilityScore: rideExecution.repeatabilityScore,
+              cadenceControlScore: rideExecution.cadenceControlScore,
+              executionBreakdown: rideExecution.executionBreakdown,
               chartData: chartData,
               // Store the full compressed FIT record stream used for Block Analysis charts. Do not downsample here.
               sampleData: chartData.map((point, pointIndex) => ({
@@ -2540,7 +4077,8 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                   heart_rate: Number(point.hr) || null,
                   cadence: Number(point.cadence) || null,
                   target_power: Number(point.target) || null
-              }))
+              })),
+              segments: rideExecution.segments
           };
       });
 
@@ -2859,6 +4397,8 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
 
   const handleSelectedRideSelect = (ride) => {
     setSelectedBlockRide(ride);
+    setSelectedSegmentIndex(null);
+    setIsSegmentTableOpen(false);
     setSelectedRideZoomRange(null);
     setSelectedRideZoomStart(null);
     setSelectedRideZoomEnd(null);
@@ -2964,6 +4504,8 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
           .no-print { display: none !important; }
           main { padding: 0 !important; margin: 0 !important; max-width: 100% !important; }
           textarea { height: auto !important; overflow: visible !important; border: none !important; background: transparent !important; resize: none !important; box-shadow: none !important; }
+          .report-section-card { page-break-inside: avoid; break-inside: avoid; overflow: visible !important; }
+          #custom-report-export { overflow: visible !important; max-width: none !important; }
           footer { display: none !important; }
         }
       `}</style>
@@ -2985,6 +4527,7 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
             <button onClick={() => setView('onboarding')} className={`px-4 py-2 text-xs font-bold uppercase rounded-md transition ${view === 'onboarding' ? 'bg-blue-600' : 'hover:bg-slate-800'}`}>Intake Sync</button>
             <button onClick={() => setView('longterm')} className={`px-4 py-2 text-xs font-bold uppercase rounded-md transition ${view === 'longterm' ? 'bg-emerald-600' : 'hover:bg-slate-800'}`}>Long-Term View</button>
             <button onClick={() => setView('report')} className={`px-4 py-2 text-xs font-bold uppercase rounded-md transition ${view === 'report' ? 'bg-blue-600' : 'hover:bg-slate-800'}`}>Block Analysis</button>
+            <button onClick={() => setView('builder')} className={`px-4 py-2 text-xs font-bold uppercase rounded-md transition ${view === 'builder' ? 'bg-amber-500 text-slate-900' : 'hover:bg-slate-800'}`}>Report Builder</button>
             <button onClick={handleAuthSignOut} className="px-4 py-2 text-xs font-bold uppercase rounded-md transition text-slate-300 hover:bg-slate-800">Sign Out</button>
           </div>
         </div>
@@ -2992,8 +4535,18 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
 
       <main className="max-w-7xl mx-auto px-6 pt-8 relative">
         
+        {reportAddStatus && (
+          <div className="fixed top-24 right-6 z-[2100] bg-amber-50 border border-amber-200 text-amber-800 px-4 py-3 rounded-xl shadow-xl no-print text-sm font-bold">
+            {reportAddStatus}
+          </div>
+        )}
+
         {view === 'longterm' && (
-          <LongTermView riderId={riderData.supabaseId} riderName={riderData.name} aiRequest={fetchOpenAIResponse} knowledgeBase={knowledgeBase} />
+          <LongTermView riderId={riderData.supabaseId} riderName={riderData.name} aiRequest={fetchOpenAIResponse} knowledgeBase={knowledgeBase} onAddToReport={addSectionToActiveReport} />
+        )}
+
+        {view === 'builder' && (
+          <ReportBuilder supabaseClient={supabase} riderData={riderData} currentUser={authSession?.user} activeReportId={activeCustomReportId} setActiveReportId={setActiveCustomReportId} />
         )}
 
         {/* === RIDER PROFILE & CONFIGURATION VIEW === */}
@@ -3022,8 +4575,21 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                             {saveStatus ? <CheckCircle2 className="w-4 h-4" /> : <Save className="w-4 h-4" />} 
                             {saveStatus || "Save Profile"}
                         </button>
+                        <button
+                            onClick={handleRecalibrateRiderZones}
+                            disabled={isRecalibratingZones || !riderData.supabaseId}
+                            className={`px-4 py-2 rounded-lg text-xs font-bold uppercase transition shadow-sm w-full md:w-auto min-w-[190px] ${isRecalibratingZones || !riderData.supabaseId ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 text-white'}`}
+                        >
+                            {isRecalibratingZones ? 'Recalculating...' : 'Recalculate Ride Scores'}
+                        </button>
                     </div>
                 </div>
+
+                {recalibrationStatus && (
+                    <div className="bg-blue-50 border border-blue-100 text-blue-800 rounded-xl px-4 py-3 text-sm font-bold">
+                        {recalibrationStatus}
+                    </div>
+                )}
 
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                     {/* Basic Info & Zones Config */}
@@ -3611,7 +5177,7 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                                                 return (
                                                 <div key={rIdx} onClick={() => handleSelectedRideSelect(ride)} className={`group relative w-full hover:z-[100] ${selectedBlockRide?.id === ride.id ? 'ring-2 ring-blue-400 rounded-lg' : ''}`}>
                                                     <div className={`w-full p-2 rounded-lg flex flex-col items-start justify-center transition-all border shadow-sm cursor-pointer ${ride.syncMethod === 'No Context Match' ? 'bg-white border-slate-300 text-slate-600' : 'bg-blue-600 text-white border-blue-600'} hover:scale-105`} title="Click to update the full ride chart below">
-                                                        <div className="flex justify-between items-center w-full mb-1"><span className="text-[12px] font-black">{ride.tss} TSS</span><span className="text-[9px] font-bold opacity-80">{ride.duration}h</span></div>
+                                                        <div className="flex justify-between items-center w-full mb-1"><span className="text-[12px] font-black">{ride.tss} TSS</span><span className="text-[9px] font-bold opacity-80">{ride.executionScore ? `${ride.executionScore}/100` : `${ride.duration}h`}</span></div>
                                                         <div className="flex justify-between items-center w-full mb-1 text-[9px] font-bold opacity-80"><span>NP {ride.np || 'N/A'}W</span><span>VI {ride.vi || 'N/A'}</span></div>
                                                         <div className="flex justify-between items-center w-full"><span className="text-[9px] font-bold opacity-80">{ride.watts}W</span><span className="text-[9px] font-bold opacity-80">{ride.hr}bpm</span></div>
                                                     </div>
@@ -3645,6 +5211,12 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                                                                 <div className="bg-blue-50 p-2 rounded border border-blue-100"><p className="text-[8px] uppercase font-black text-blue-600 mb-0.5">Ride Purpose</p><p className="text-[10px] text-blue-900 italic leading-relaxed">{ride.summary}</p></div>
                                                             )}
                                                         </div>
+                                                        {ride.executionScore && (
+                                                          <div className="mt-3 p-2 rounded-lg bg-emerald-50 border border-emerald-100">
+                                                            <p className="text-[8px] uppercase font-black text-emerald-700">Execution Score</p>
+                                                            <p className="text-[11px] font-bold text-emerald-900">{ride.executionScore}/100 · {ride.executionSummary || 'Workout execution scored from lap/segment data.'}</p>
+                                                          </div>
+                                                        )}
                                                         <div className="mt-3 pt-2 border-t border-slate-100 grid grid-cols-6 gap-2 text-center">
                                                             <div><p className="text-[7px] uppercase font-bold text-slate-400">Pwr</p><p className="text-[11px] font-black text-slate-700">{ride.watts}W</p></div>
                                                             <div><p className="text-[7px] uppercase font-bold text-slate-400">NP</p><p className="text-[11px] font-black text-slate-700">{ride.np || 'N/A'}W</p></div>
@@ -3690,12 +5262,86 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                   ? [selectedRideZoomRange.start, selectedRideZoomRange.end]
                   : [0, selectedRideDurationMinutes];
                 const selectedRideDisplayMetrics = calculateSelectedRideMetrics(selectedRideChartData, selectedBlockRide);
+                const selectedSegment = selectedBlockRide?.segments?.find(s => Number(s.segment_index) === Number(selectedSegmentIndex));
                 return (
                 <Card title="Selected Ride Detail" icon={Activity} subtitle="Click any ride card above to update this chart">
                     <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-4">
                         <div>
                             <h4 className="text-xl font-black text-slate-900 leading-tight">{selectedBlockRide.name}</h4>
                             <p className="text-xs text-slate-400 font-bold uppercase tracking-wider">{selectedBlockRide.date} • {selectedBlockRide.duration}h • {selectedBlockRide.syncMethod}</p>
+                            {selectedBlockRide.executionScore && (
+                              <p className="text-xs text-emerald-700 font-bold mt-2 max-w-3xl">Execution: {selectedBlockRide.executionScore}/100 · {selectedBlockRide.executionSummary}</p>
+                            )}
+                            <div className="no-print flex flex-wrap gap-2 mt-3">
+                              <button
+                                onClick={() => addSectionToActiveReport({
+                                  sectionType: 'chart',
+                                  sectionTitle: `Ride Detail Chart - ${selectedBlockRide.name}`,
+                                  content: `${selectedBlockRide.date} · ${selectedBlockRide.duration}h · Execution ${selectedBlockRide.executionScore || 'N/A'}/100`,
+                                  chartConfig: {
+                                    chartType: 'selected_ride_detail',
+                                    chartTitle: selectedBlockRide.name,
+                                    rideId: selectedBlockRide.supabaseRideId || selectedBlockRide.id,
+                                    rideDate: selectedBlockRide.date,
+                                    zoomRange: selectedRideZoomRange,
+                                    metrics: ['Power', 'NP', 'VI', 'Cadence', 'HR', 'P:HR'],
+                                    displayMetrics: {
+                                      Pwr: `${selectedRideDisplayMetrics.avgPower}W`,
+                                      NP: `${selectedRideDisplayMetrics.np || 'N/A'}W`,
+                                      VI: selectedRideDisplayMetrics.vi || 'N/A',
+                                      Cad: selectedRideDisplayMetrics.cadence || 'N/A',
+                                      HR: selectedRideDisplayMetrics.hr || 'N/A',
+                                      PHR: `${selectedRideDisplayMetrics.decoupling}%`,
+                                      Execution: selectedBlockRide.executionScore ? `${selectedBlockRide.executionScore}/100` : 'N/A'
+                                    },
+                                    chartData: selectedRideChartData.slice(0, 5000),
+                                    executionScore: selectedBlockRide.executionScore || null
+                                  },
+                                  sourceType: 'block_ride_chart',
+                                  sourceId: selectedBlockRide.supabaseRideId || selectedBlockRide.id
+                                })}
+                                className="px-3 py-2 bg-amber-500 hover:bg-amber-600 text-slate-900 rounded-lg text-[10px] font-black uppercase"
+                              >
+                                Add Ride Chart to Report
+                              </button>
+                              {selectedBlockRide?.segments?.length > 0 && (
+                                <button
+                                  onClick={() => addSectionToActiveReport({
+                                    sectionType: 'table',
+                                    sectionTitle: `Lap / Segment Analysis - ${selectedBlockRide.name}`,
+                                    content: selectedBlockRide.segments.map(s => `#${s.segment_index} ${s.segment_type} · ${Math.round(Number(s.duration_seconds) || 0)}s · Target ${s.target_power_zone} ${s.target_power_low || 'N/A'}-${s.target_power_high || '+'}W · Actual ${Math.round(Number(s.avg_power) || 0)}W · Score ${s.segment_score || 'N/A'} · ${s.coaching_note || ''}`).join('\n'),
+                                    chartConfig: {
+                                      chartType: 'segment_table',
+                                      chartTitle: `Lap / Segment Analysis - ${selectedBlockRide.name}`,
+                                      rideId: selectedBlockRide.supabaseRideId || selectedBlockRide.id,
+                                      segmentCount: selectedBlockRide.segments.length,
+                                      segments: selectedBlockRide.segments.map(s => ({
+                                        segment_index: s.segment_index,
+                                        segment_type: s.segment_type,
+                                        duration_seconds: s.duration_seconds,
+                                        target_power_zone: s.target_power_zone,
+                                        target_power_low: s.target_power_low,
+                                        target_power_high: s.target_power_high,
+                                        avg_power: s.avg_power,
+                                        avg_hr: s.avg_hr,
+                                        segment_score: s.segment_score,
+                                        power_score: s.power_score,
+                                        hr_score: s.hr_score,
+                                        recovery_score: s.recovery_score,
+                                        power_result: s.power_result,
+                                        hr_result: s.hr_result,
+                                        coaching_note: s.coaching_note
+                                      }))
+                                    },
+                                    sourceType: 'block_segment_table',
+                                    sourceId: selectedBlockRide.supabaseRideId || selectedBlockRide.id
+                                  })}
+                                  className="px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-[10px] font-black uppercase"
+                                >
+                                  Add Segment Table
+                                </button>
+                              )}
+                            </div>
                         </div>
                         <div className="grid grid-cols-3 md:grid-cols-6 gap-2 text-center min-w-[360px]">
                             <div className="bg-slate-50 rounded-lg p-2 border border-slate-100"><p className="text-[8px] uppercase font-bold text-slate-400">Pwr</p><p className="text-sm font-black text-slate-700">{selectedRideDisplayMetrics.avgPower}W</p></div>
@@ -3706,6 +5352,48 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                             <div className="bg-slate-50 rounded-lg p-2 border border-slate-100"><p className="text-[8px] uppercase font-bold text-slate-400">P:HR</p><p className={`text-sm font-black ${selectedRideDisplayMetrics.decoupling > 5 ? 'text-red-500' : 'text-green-600'}`}>{selectedRideDisplayMetrics.decoupling}%</p></div>
                         </div>
                     </div>
+                    {selectedBlockRide.executionScore && (
+                      <div className="mb-4 rounded-2xl border border-slate-200 bg-white overflow-hidden">
+                        <div className="p-4 border-b border-slate-100 bg-emerald-50/70">
+                          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                            <div>
+                              <p className="text-[9px] uppercase font-black tracking-widest text-emerald-700">Workout Execution Score</p>
+                              <p className="text-4xl font-black text-emerald-900">{selectedBlockRide.executionScore}<span className="text-base text-emerald-500">/100</span></p>
+                            </div>
+                            <p className="text-[12px] font-bold text-emerald-950 leading-relaxed max-w-3xl">{selectedBlockRide.executionSummary}</p>
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 p-4">
+                          {(selectedBlockRide.executionBreakdown?.pillars || [
+                            { label: 'Completion', points: selectedBlockRide.completionScore ? Math.round((selectedBlockRide.completionScore / 100) * 20) : null, max: 20, score: selectedBlockRide.completionScore, summary: 'Workout completion based on detected segments.' },
+                            { label: 'Power Accuracy', points: selectedBlockRide.powerAccuracyScore ? Math.round((selectedBlockRide.powerAccuracyScore / 100) * 35) : null, max: 35, score: selectedBlockRide.powerAccuracyScore, summary: 'Target power execution by segment.' },
+                            { label: 'HR Response', points: selectedBlockRide.hrResponseScore ? Math.round((selectedBlockRide.hrResponseScore / 100) * 15) : null, max: 15, score: selectedBlockRide.hrResponseScore, summary: 'Heart-rate response relative to segment type.' },
+                            { label: 'Recovery Quality', points: selectedBlockRide.recoveryQualityScore ? Math.round((selectedBlockRide.recoveryQualityScore / 100) * 15) : null, max: 15, score: selectedBlockRide.recoveryQualityScore, summary: 'Recovery discipline between work segments.' },
+                            { label: 'Repeatability / Fade', points: selectedBlockRide.repeatabilityScore ? Math.round((selectedBlockRide.repeatabilityScore / 100) * 10) : null, max: 10, score: selectedBlockRide.repeatabilityScore, summary: 'Repeatability of the work segments.' },
+                            { label: 'Cadence / Control', points: selectedBlockRide.cadenceControlScore ? Math.round((selectedBlockRide.cadenceControlScore / 100) * 5) : null, max: 5, score: selectedBlockRide.cadenceControlScore, summary: 'Cadence and execution control.' }
+                          ]).map((pillar) => {
+                            const ratio = pillar?.max ? Number(pillar.points || 0) / Number(pillar.max) : 0;
+                            const tone = ratio >= 0.9 ? 'emerald' : ratio >= 0.75 ? 'blue' : ratio >= 0.6 ? 'amber' : 'red';
+                            const barClass = tone === 'emerald' ? 'bg-emerald-500' : tone === 'blue' ? 'bg-blue-500' : tone === 'amber' ? 'bg-amber-500' : 'bg-red-500';
+                            return (
+                              <div key={pillar.label} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                                <div className="flex items-start justify-between gap-2">
+                                  <div>
+                                    <p className="text-[9px] uppercase font-black tracking-wider text-slate-400">{pillar.label}</p>
+                                    <p className="text-2xl font-black text-slate-900">{pillar.points ?? 'N/A'}<span className="text-xs text-slate-400">/{pillar.max}</span></p>
+                                  </div>
+                                  <span className="text-[10px] font-black text-slate-500">{pillar.score ?? 'N/A'}%</span>
+                                </div>
+                                <div className="h-2 bg-white rounded-full border border-slate-100 mt-2 overflow-hidden">
+                                  <div className={`h-full ${barClass}`} style={{ width: `${Math.max(0, Math.min(100, ratio * 100))}%` }} />
+                                </div>
+                                <p className="text-[11px] text-slate-600 leading-snug mt-2">{pillar.summary}</p>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                     <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3 rounded-lg bg-slate-50 border border-slate-100 px-3 py-2 no-print">
                         <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
                             Drag across the chart to zoom into an interval.
@@ -3738,6 +5426,23 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                                     <Area isAnimationActive={false} yAxisId="power" type="linear" dataKey="watts" stroke="#3b82f6" fill="#eff6ff" strokeWidth={1.8} dot={false} name="Watts" />
                                     <Line isAnimationActive={false} yAxisId="hr" type="linear" dataKey="hr" stroke="#ef4444" strokeWidth={1.6} dot={false} name="HR (bpm)" />
                                     <Line isAnimationActive={false} yAxisId="power" type="linear" dataKey="cadence" stroke="#f59e0b" strokeWidth={1.4} dot={false} name="Cadence" />
+                                    {(selectedBlockRide?.segments || []).map(segment => (
+                                      <ReferenceArea
+                                        key={`segment-overlay-${segment.segment_index}`}
+                                        yAxisId="power"
+                                        x1={Number(segment.start_seconds) / 60}
+                                        x2={Number(segment.end_seconds) / 60}
+                                        fill="#94a3b8"
+                                        fillOpacity={0.07}
+                                        strokeOpacity={0}
+                                      />
+                                    ))}
+                                    {selectedSegment && (
+                                      <ReferenceArea yAxisId="power" x1={Number(selectedSegment.start_seconds) / 60} x2={Number(selectedSegment.end_seconds) / 60} strokeOpacity={0.25} fill="#60a5fa" fillOpacity={0.22} />
+                                    )}
+                                    {selectedSegment?.target_power_low && (
+                                      <ReferenceArea yAxisId="power" y1={Number(selectedSegment.target_power_low)} y2={Number(selectedSegment.target_power_high) || Number(selectedSegment.target_power_low) + 50} fill="#10b981" fillOpacity={0.10} />
+                                    )}
                                     {selectedRideZoomStart !== null && selectedRideZoomEnd !== null && (
                                       <ReferenceArea yAxisId="power" x1={selectedRideZoomStart} x2={selectedRideZoomEnd} strokeOpacity={0.25} fill="#bfdbfe" fillOpacity={0.25} />
                                     )}
@@ -3746,6 +5451,64 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                         </div>
                     ) : (
                         <div className="p-6 rounded-xl bg-slate-50 border border-slate-100 text-sm text-slate-500">No chart data available for this ride.</div>
+                    )}
+
+                    {selectedBlockRide?.segments?.length > 0 && (
+                        <div className="mt-6 bg-white rounded-xl border border-slate-200 overflow-hidden">
+                            <div className="px-4 py-3 border-b border-slate-100 flex flex-col md:flex-row md:items-center justify-between gap-2">
+                                <div>
+                                    <h4 className="font-black text-slate-800 text-sm uppercase">Lap / Segment Analysis</h4>
+                                    <p className="text-xs text-slate-500">Detected workout segments are shaded in gray on the chart. Expand the details and click a lap to highlight it and show the target power band.</p>
+                                </div>
+                                <div className="flex items-center gap-3">
+                                  {selectedSegment && <button onClick={() => setSelectedSegmentIndex(null)} className="text-[10px] font-black uppercase text-blue-600 hover:text-blue-800">Clear Segment</button>}
+                                  <button onClick={() => setIsSegmentTableOpen(prev => !prev)} className="px-3 py-1.5 rounded-md bg-slate-900 text-white text-[10px] font-black uppercase hover:bg-slate-700 transition">
+                                    {isSegmentTableOpen ? 'Hide Lap Detail' : `Show Lap Detail (${selectedBlockRide.segments.length})`}
+                                  </button>
+                                </div>
+                            </div>
+                            {isSegmentTableOpen && <div className="overflow-x-auto">
+                                <table className="w-full text-xs">
+                                    <thead className="bg-slate-50 text-slate-500 uppercase">
+                                        <tr>
+                                            <th className="text-left p-3">#</th>
+                                            <th className="text-left p-3">Type</th>
+                                            <th className="text-right p-3">Duration</th>
+                                            <th className="text-right p-3">Target Power</th>
+                                            <th className="text-right p-3">Actual Power</th>
+                                            <th className="text-right p-3">Power</th>
+                                            <th className="text-right p-3">Seg</th>
+                                            <th className="text-right p-3">Pwr Score</th>
+                                            <th className="text-right p-3">HR Score</th>
+                                            <th className="text-right p-3">Target HR</th>
+                                            <th className="text-right p-3">Actual HR</th>
+                                            <th className="text-left p-3">Note</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {selectedBlockRide.segments.map(segment => {
+                                            const isActive = Number(segment.segment_index) === Number(selectedSegmentIndex);
+                                            return (
+                                                <tr key={segment.id || segment.segment_index} onClick={() => setSelectedSegmentIndex(segment.segment_index)} className={`border-t border-slate-100 cursor-pointer transition ${isActive ? 'bg-blue-50' : 'hover:bg-slate-50'}`}>
+                                                    <td className="p-3 font-bold">{segment.segment_index}</td>
+                                                    <td className="p-3 font-bold capitalize">{segment.segment_type || 'unknown'}</td>
+                                                    <td className="p-3 text-right">{formatSegmentDuration(segment.duration_seconds)}</td>
+                                                    <td className="p-3 text-right">{segment.target_power_low || 'N/A'}–{segment.target_power_high || '+'}W</td>
+                                                    <td className="p-3 text-right">{Math.round(Number(segment.avg_power) || 0)}W</td>
+                                                    <td className={`p-3 text-right font-bold ${segment.power_result === 'in_range' ? 'text-green-600' : segment.power_result === 'above' ? 'text-amber-600' : segment.power_result === 'below' ? 'text-red-500' : 'text-slate-500'}`}>{segment.power_result || 'unknown'}</td>
+                                                    <td className="p-3 text-right font-black text-slate-800">{segment.segment_score !== null && segment.segment_score !== undefined ? `${Math.round(Number(segment.segment_score))}` : 'N/A'}</td>
+                                                    <td className="p-3 text-right">{segment.power_score ?? 'N/A'}</td>
+                                                    <td className="p-3 text-right">{segment.hr_score ?? 'N/A'}</td>
+                                                    <td className="p-3 text-right">{segment.target_hr_low || 'N/A'}–{segment.target_hr_high || '+'} bpm</td>
+                                                    <td className="p-3 text-right">{Math.round(Number(segment.avg_hr) || 0)} bpm</td>
+                                                    <td className="p-3 text-slate-600 min-w-[260px]">{segment.coaching_note}</td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>}
+                        </div>
                     )}
                     {selectedBlockRide.summary && selectedBlockRide.summary !== "Technical data synced. Pending context matching..." && (
                         <div className="mt-4 bg-blue-50 p-3 rounded-lg border border-blue-100"><p className="text-[9px] uppercase font-black text-blue-600 mb-1">Ride Purpose</p><p className="text-xs text-blue-900 italic leading-relaxed">{selectedBlockRide.summary}</p></div>
@@ -3762,7 +5525,21 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                     </div>
                 )}
                 
-                <div className="flex justify-end mb-2 no-print">
+                <div className="flex justify-end gap-2 mb-2 no-print">
+                    {closingStatement && (
+                      <button
+                        onClick={() => addSectionToActiveReport({
+                          sectionType: 'ai_insight',
+                          sectionTitle: `${analysisBlockType || 'Block'} AI Coach Summary`,
+                          content: closingStatement,
+                          sourceType: 'block_ai',
+                          sourceId: selectedAnalysisBlockId || `${analysisBlockStart}-${analysisBlockEnd}`
+                        })}
+                        className="bg-amber-500 text-slate-900 hover:bg-amber-600 px-3 py-1.5 rounded-lg text-[10px] font-black transition uppercase tracking-wider"
+                      >
+                        Add AI Summary to Report
+                      </button>
+                    )}
                     <button 
                       onClick={handleGenerateStatement}
                       disabled={isGeneratingStatement || performanceData.length === 0}
@@ -3822,7 +5599,15 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
               {chatMessages.map((msg, idx) => (
                 <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                   <div className={`max-w-[85%] rounded-2xl p-3 text-sm leading-relaxed ${msg.role === 'user' ? 'bg-blue-600 text-white rounded-tr-sm' : 'bg-white border border-slate-200 text-slate-800 rounded-tl-sm shadow-sm'}`}>
-                    {msg.content}
+                    <div className="whitespace-pre-wrap">{msg.content}</div>
+                    {msg.role === 'assistant' && idx > 0 && (
+                      <button
+                        onClick={() => addChatInsightToReport(msg.content)}
+                        className="mt-2 text-[9px] font-black uppercase tracking-wider text-amber-600 hover:text-amber-700 no-print"
+                      >
+                        Add to Report
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
