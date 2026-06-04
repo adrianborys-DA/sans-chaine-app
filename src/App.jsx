@@ -1506,7 +1506,7 @@ const ReportBuilder = ({ supabaseClient, riderData, currentUser, activeReportId,
                 <td className="p-3 font-bold">{segment.segment_index}</td>
                 <td className="p-3 font-bold capitalize">{segment.segment_type || 'segment'}</td>
                 <td className="p-3 text-right">{Math.round(Number(segment.duration_seconds) || 0)}s</td>
-                <td className="p-3 text-right">{segment.target_power_zone || ''} {segment.target_power_low || 'N/A'}–{segment.target_power_high || '+'}W</td>
+                <td className="p-3 text-right">{segment.target_power_zone || ''} {formatZoneRange(segment.target_power_low, segment.target_power_high, 'W')}</td>
                 <td className="p-3 text-right">{Math.round(Number(segment.avg_power) || 0)}W / {Math.round(Number(segment.avg_hr) || 0)} bpm</td>
                 <td className="p-3 text-right font-black">{segment.segment_score || 'N/A'}</td>
                 <td className="p-3 text-right">{segment.power_score ?? 'N/A'}</td>
@@ -2712,6 +2712,11 @@ const App = () => {
             start_seconds: segment.start_seconds,
             end_seconds: segment.end_seconds,
             duration_seconds: segment.duration_seconds,
+            observed_power_zone: segment.observed_power_zone || null,
+            observed_hr_zone: segment.observed_hr_zone || null,
+            target_source: segment.target_source || 'inferred',
+            target_locked: segment.target_locked || false,
+            manually_adjusted: segment.manually_adjusted || false,
             target_power_low: segment.target_power_low,
             target_power_high: segment.target_power_high,
             target_power_zone: segment.target_power_zone,
@@ -2955,9 +2960,42 @@ const App = () => {
     if (powerZone === "Anaerobic") return "anaerobic";
     if (powerZone === "VO2 Max") return "vo2";
     if (powerZone === "Threshold") return "threshold";
-    if (["Sweet Spot", "Tempo High"].includes(powerZone)) return "tempo";
-    if (["Tempo Z2", "Endurance"].includes(powerZone)) return "endurance";
+    if (["Sweet Spot", "Tempo High", "Tempo Z2"].includes(powerZone)) return "tempo";
+    if (powerZone === "Endurance") return "endurance";
     if (["Recovery", "Below Zone"].includes(powerZone)) return "recovery";
+    return "unknown";
+  };
+
+  const TARGET_POWER_ZONE_OPTIONS = [
+    "Recovery",
+    "Endurance",
+    "Tempo Z2",
+    "Tempo High",
+    "Sweet Spot",
+    "Threshold",
+    "VO2 Max",
+    "Anaerobic"
+  ];
+
+  const normalizePowerZoneName = (zoneName) => {
+    if (!zoneName) return "Unknown";
+    if (zoneName === "Tempo") return "Tempo High";
+    if (zoneName === "Below Zone") return "Recovery";
+    return zoneName;
+  };
+
+  const getSegmentTypeFromTargetZone = ({ targetPowerZone, durationSeconds, segmentIndex, totalSegments }) => {
+    const zone = normalizePowerZoneName(targetPowerZone);
+    const duration = Number(durationSeconds) || 0;
+    if (segmentIndex === 1 && duration >= 300 && ["Recovery", "Endurance", "Tempo Z2"].includes(zone)) return "warmup";
+    if (segmentIndex === totalSegments && duration >= 300 && ["Recovery", "Endurance", "Tempo Z2"].includes(zone)) return "cooldown";
+    if (duration <= 30 && ["VO2 Max", "Anaerobic"].includes(zone)) return "sprint";
+    if (zone === "Anaerobic") return "anaerobic";
+    if (zone === "VO2 Max") return "vo2";
+    if (zone === "Threshold") return "threshold";
+    if (["Sweet Spot", "Tempo High", "Tempo Z2"].includes(zone)) return "tempo";
+    if (zone === "Endurance") return "endurance";
+    if (zone === "Recovery") return "recovery";
     return "unknown";
   };
 
@@ -3259,17 +3297,22 @@ const App = () => {
     const avgPower = Number(segment.avg_power) || 0;
     const avgHr = Number(segment.avg_hr) || 0;
 
-    const powerZone = avgPower > 0 ? getPowerZone(avgPower, riderZones) : "Unknown";
-    const segmentType = inferSegmentType({
-      durationSeconds,
-      powerZone,
-      avgPower,
-      segmentIndex,
-      totalSegments
-    });
+    const observedPowerZone = avgPower > 0 ? getPowerZone(avgPower, riderZones) : "Unknown";
+    const observedHrZone = avgHr > 0 ? getHRZone(avgHr, riderZones) : "Unknown";
+    const hasManualTarget = segment.target_locked === true || segment.manually_adjusted === true || segment.target_source === 'manual';
+    const targetPowerZone = normalizePowerZoneName(hasManualTarget ? segment.target_power_zone : observedPowerZone);
+    const segmentType = hasManualTarget
+      ? getSegmentTypeFromTargetZone({ targetPowerZone, durationSeconds, segmentIndex, totalSegments })
+      : inferSegmentType({
+          durationSeconds,
+          powerZone: observedPowerZone,
+          avgPower,
+          segmentIndex,
+          totalSegments
+        });
 
     const expectedHrZone = getExpectedHrZoneForSegment(segmentType, durationSeconds);
-    const [targetPowerLow, targetPowerHigh] = getPowerZoneRange(powerZone, riderZones);
+    const [targetPowerLow, targetPowerHigh] = getPowerZoneRange(targetPowerZone, riderZones);
     const [targetHrLow, targetHrHigh] = getHrZoneRange(expectedHrZone, riderZones);
 
     const powerResult = classifyRangeResult(avgPower, targetPowerLow, targetPowerHigh);
@@ -3283,7 +3326,7 @@ const App = () => {
     const coachingNote = buildSegmentCoachingNote({
       segmentType,
       durationSeconds,
-      powerZone,
+      powerZone: targetPowerZone,
       powerResult,
       hrResponse: hrResult
     });
@@ -3291,16 +3334,133 @@ const App = () => {
     return scoreSegmentExecution({
       ...segment,
       segment_type: segmentType,
-      target_power_zone: powerZone,
+      observed_power_zone: observedPowerZone,
+      observed_hr_zone: observedHrZone,
+      target_power_zone: targetPowerZone,
       target_power_low: targetPowerLow,
       target_power_high: targetPowerHigh,
       target_hr_zone: expectedHrZone,
       target_hr_low: targetHrLow,
       target_hr_high: targetHrHigh,
+      target_source: hasManualTarget ? 'manual' : (segment.target_source || 'inferred'),
+      target_locked: hasManualTarget,
+      manually_adjusted: hasManualTarget,
       power_result: powerResult,
       hr_result: hrResult,
       coaching_note: coachingNote
     });
+  };
+
+  const handleUpdateSegmentTargetZone = async (segment, newTargetZone, event = null) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const previousScrollY = typeof window !== 'undefined' ? window.scrollY : 0;
+    if (!supabase || !selectedBlockRide?.supabaseRideId) {
+      alert('Select a saved ride before editing segment targets.');
+      return;
+    }
+
+    const totalSegments = selectedBlockRide.segments?.length || 1;
+    const segmentIndex = Number(segment.segment_index) || 1;
+    const manuallyTargetedSegment = {
+      ...segment,
+      target_power_zone: newTargetZone,
+      target_source: 'manual',
+      target_locked: true,
+      manually_adjusted: true
+    };
+
+    const currentZones = riderData?.zones || {};
+    const recalibratedSegment = recalibrateSegmentToCurrentZones(
+      manuallyTargetedSegment,
+      currentZones,
+      segmentIndex,
+      totalSegments
+    );
+
+    const nextSegments = (selectedBlockRide.segments || []).map(s =>
+      Number(s.segment_index) === segmentIndex ? recalibratedSegment : s
+    );
+    const nextRideScore = calculateRideExecutionScores(nextSegments, selectedBlockRide);
+    const nextRide = {
+      ...selectedBlockRide,
+      completionScore: nextRideScore.completionScore,
+      effectivenessScore: nextRideScore.effectivenessScore,
+      executionScore: nextRideScore.executionScore,
+      powerAccuracyScore: nextRideScore.powerAccuracyScore,
+      hrResponseScore: nextRideScore.hrResponseScore,
+      recoveryQualityScore: nextRideScore.recoveryQualityScore,
+      repeatabilityScore: nextRideScore.repeatabilityScore,
+      cadenceControlScore: nextRideScore.cadenceControlScore,
+      executionBreakdown: nextRideScore.executionBreakdown,
+      executionSummary: nextRideScore.executionSummary,
+      segments: nextRideScore.segments
+    };
+
+    try {
+      const { error: segmentError } = await supabase
+        .from('ride_segments')
+        .update({
+          segment_type: recalibratedSegment.segment_type,
+          observed_power_zone: recalibratedSegment.observed_power_zone || null,
+          observed_hr_zone: recalibratedSegment.observed_hr_zone || null,
+          target_power_zone: recalibratedSegment.target_power_zone,
+          target_power_low: recalibratedSegment.target_power_low,
+          target_power_high: recalibratedSegment.target_power_high,
+          target_hr_zone: recalibratedSegment.target_hr_zone,
+          target_hr_low: recalibratedSegment.target_hr_low,
+          target_hr_high: recalibratedSegment.target_hr_high,
+          target_source: 'manual',
+          target_locked: true,
+          manually_adjusted: true,
+          power_result: recalibratedSegment.power_result,
+          hr_result: recalibratedSegment.hr_result,
+          segment_score: recalibratedSegment.segment_score,
+          power_score: recalibratedSegment.power_score,
+          hr_score: recalibratedSegment.hr_score,
+          recovery_score: recalibratedSegment.recovery_score,
+          repeatability_flag: recalibratedSegment.repeatability_flag || null,
+          coaching_note: recalibratedSegment.coaching_note
+        })
+        .eq('id', segment.id);
+
+      if (segmentError) throw segmentError;
+
+      const { error: rideError } = await supabase
+        .from('rides')
+        .update({
+          completion_score: nextRideScore.completionScore,
+          effectiveness_score: nextRideScore.effectivenessScore,
+          execution_score: nextRideScore.executionScore,
+          power_accuracy_score: nextRideScore.powerAccuracyScore,
+          hr_response_score: nextRideScore.hrResponseScore,
+          recovery_quality_score: nextRideScore.recoveryQualityScore,
+          repeatability_score: nextRideScore.repeatabilityScore,
+          cadence_control_score: nextRideScore.cadenceControlScore,
+          execution_breakdown: nextRideScore.executionBreakdown,
+          execution_summary: nextRideScore.executionSummary
+        })
+        .eq('id', selectedBlockRide.supabaseRideId);
+
+      if (rideError) throw rideError;
+
+      setSelectedBlockRide(nextRide);
+      setRawRides(prev => prev.map(r => (r.supabaseRideId === nextRide.supabaseRideId || r.id === nextRide.id) ? nextRide : r));
+      setPerformanceData(prev => prev.map(week => ({
+        ...week,
+        days: week.days.map(day => ({
+          ...day,
+          rides: day.rides.map(r => (r.supabaseRideId === nextRide.supabaseRideId || r.id === nextRide.id) ? nextRide : r)
+        }))
+      })));
+
+      requestAnimationFrame(() => {
+        window.scrollTo({ top: previousScrollY, left: 0, behavior: 'auto' });
+      });
+    } catch (error) {
+      console.error('Segment target update failed:', error);
+      alert(`Segment target update failed: ${error.message}`);
+    }
   };
 
   const handleRecalibrateRiderZones = async () => {
@@ -3389,6 +3549,11 @@ const App = () => {
           segmentUpdateRows.push({
             id: segment.id,
             segment_type: segment.segment_type,
+            observed_power_zone: segment.observed_power_zone || null,
+            observed_hr_zone: segment.observed_hr_zone || null,
+            target_source: segment.target_source || 'inferred',
+            target_locked: segment.target_locked || false,
+            manually_adjusted: segment.manually_adjusted || false,
             target_power_low: segment.target_power_low,
             target_power_high: segment.target_power_high,
             target_power_zone: segment.target_power_zone,
@@ -3505,12 +3670,17 @@ const App = () => {
         start_seconds: startSeconds,
         end_seconds: endSeconds,
         duration_seconds: durationSeconds,
+        observed_power_zone: powerZone,
+        observed_hr_zone: actualHrZone,
         target_power_low: targetPowerLow,
         target_power_high: targetPowerHigh,
         target_power_zone: powerZone,
         target_hr_low: targetHrLow,
         target_hr_high: targetHrHigh,
         target_hr_zone: expectedHrZone,
+        target_source: 'inferred',
+        target_locked: false,
+        manually_adjusted: false,
         avg_power: avgPower || null,
         max_power: maxPower || null,
         avg_hr: avgHr || null,
@@ -3530,6 +3700,21 @@ const App = () => {
     const mins = Math.floor(total / 60);
     const secs = total % 60;
     return `${mins}:${String(secs).padStart(2, '0')}`;
+  };
+
+  const hasNumericValue = (value) => value !== null && value !== undefined && value !== '' && !Number.isNaN(Number(value));
+
+  const formatZoneRange = (low, high, suffix = '') => {
+    const lowLabel = hasNumericValue(low) ? Math.round(Number(low)) : 'N/A';
+    const highLabel = hasNumericValue(high) ? Math.round(Number(high)) : '+';
+    return `${lowLabel}–${highLabel}${suffix}`;
+  };
+
+  const getSegmentDisplayType = (segment) => {
+    const targetZone = normalizePowerZoneName(segment?.target_power_zone);
+    if (targetZone && targetZone !== 'Unknown') return targetZone;
+    if (segment?.segment_type) return String(segment.segment_type).replace(/_/g, ' ');
+    return 'Unknown';
   };
 
   const getPowerZone = (val, z) => {
@@ -5473,6 +5658,8 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                                         <tr>
                                             <th className="text-left p-3">#</th>
                                             <th className="text-left p-3">Type</th>
+                                            <th className="text-left p-3">Target Zone</th>
+                                            <th className="text-left p-3">Observed Zone</th>
                                             <th className="text-right p-3">Duration</th>
                                             <th className="text-right p-3">Target Power</th>
                                             <th className="text-right p-3">Actual Power</th>
@@ -5491,15 +5678,33 @@ Write a practical, data-driven retrospective. Break down specific workouts intel
                                             return (
                                                 <tr key={segment.id || segment.segment_index} onClick={() => setSelectedSegmentIndex(segment.segment_index)} className={`border-t border-slate-100 cursor-pointer transition ${isActive ? 'bg-blue-50' : 'hover:bg-slate-50'}`}>
                                                     <td className="p-3 font-bold">{segment.segment_index}</td>
-                                                    <td className="p-3 font-bold capitalize">{segment.segment_type || 'unknown'}</td>
+                                                    <td className="p-3 font-bold">{getSegmentDisplayType(segment)}</td>
+                                                    <td className="p-3 min-w-[150px]" onClick={(e) => e.stopPropagation()}>
+                                                      <select
+                                                        className="w-full rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-bold text-slate-700 outline-none focus:ring-1 focus:ring-blue-500"
+                                                        value={normalizePowerZoneName(segment.target_power_zone)}
+                                                        onMouseDown={(e) => e.stopPropagation()}
+                                                        onChange={(e) => handleUpdateSegmentTargetZone(segment, e.target.value, e)}
+                                                      >
+                                                        {TARGET_POWER_ZONE_OPTIONS.map(zone => (
+                                                          <option key={zone} value={zone}>{zone}</option>
+                                                        ))}
+                                                      </select>
+                                                      {segment.target_source === 'manual' || segment.manually_adjusted ? (
+                                                        <p className="mt-1 text-[8px] uppercase font-black text-blue-600">Manual target</p>
+                                                      ) : (
+                                                        <p className="mt-1 text-[8px] uppercase font-black text-slate-400">Inferred</p>
+                                                      )}
+                                                    </td>
+                                                    <td className="p-3 text-left">{segment.observed_power_zone || 'N/A'}</td>
                                                     <td className="p-3 text-right">{formatSegmentDuration(segment.duration_seconds)}</td>
-                                                    <td className="p-3 text-right">{segment.target_power_low || 'N/A'}–{segment.target_power_high || '+'}W</td>
+                                                    <td className="p-3 text-right">{formatZoneRange(segment.target_power_low, segment.target_power_high, 'W')}</td>
                                                     <td className="p-3 text-right">{Math.round(Number(segment.avg_power) || 0)}W</td>
                                                     <td className={`p-3 text-right font-bold ${segment.power_result === 'in_range' ? 'text-green-600' : segment.power_result === 'above' ? 'text-amber-600' : segment.power_result === 'below' ? 'text-red-500' : 'text-slate-500'}`}>{segment.power_result || 'unknown'}</td>
                                                     <td className="p-3 text-right font-black text-slate-800">{segment.segment_score !== null && segment.segment_score !== undefined ? `${Math.round(Number(segment.segment_score))}` : 'N/A'}</td>
                                                     <td className="p-3 text-right">{segment.power_score ?? 'N/A'}</td>
                                                     <td className="p-3 text-right">{segment.hr_score ?? 'N/A'}</td>
-                                                    <td className="p-3 text-right">{segment.target_hr_low || 'N/A'}–{segment.target_hr_high || '+'} bpm</td>
+                                                    <td className="p-3 text-right">{formatZoneRange(segment.target_hr_low, segment.target_hr_high, ' bpm')}</td>
                                                     <td className="p-3 text-right">{Math.round(Number(segment.avg_hr) || 0)} bpm</td>
                                                     <td className="p-3 text-slate-600 min-w-[260px]">{segment.coaching_note}</td>
                                                 </tr>
